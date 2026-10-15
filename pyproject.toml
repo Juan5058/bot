@@ -1,0 +1,11 @@
+[project]
+name = "jarvis-core"
+version = "0.1.0"
+description = "JARVIS CORE - Fase 1"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.7,<3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
