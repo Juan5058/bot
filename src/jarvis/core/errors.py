@@ -18,5 +18,9 @@ class SimulatedModeError(JARVISCoreError):
     """Real execution is blocked in simulated mode."""
 
 
+class ToolExecutionError(JARVISCoreError):
+    """A registered simulated tool failed during execution."""
+
+
 class InvalidInputError(JARVISCoreError):
     """User input cannot be processed safely."""

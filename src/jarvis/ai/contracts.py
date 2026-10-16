@@ -10,7 +10,7 @@ from jarvis.core.context import ConversationContext
 class AIProviderContract(ABC):
     @abstractmethod
     def classify_intent(self, user_text: str) -> dict[str, Any]:
-        """Classify a user request."""
+        """Return a classification whose actionable intent is ``text_request``."""
 
     @abstractmethod
     def propose_action(self, user_text: str, context: ConversationContext) -> ToolProposal:
