@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any
-
-from jarvis.core.context import ConversationContext
 
 
 class ToolDefinition(ABC):
@@ -12,7 +10,9 @@ class ToolDefinition(ABC):
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if cls.__dictoffset__ != 0:
-            raise TypeError("ToolDefinition subclasses must use slots; instance dictionaries can shadow execute.")
+            raise TypeError("ToolDefinition subclasses must use slots.")
+        if any("execute" in base.__dict__ for base in cls.__mro__):
+            raise TypeError("Tool definitions cannot implement executable behavior.")
         reserved = {
             "name",
             "description",
@@ -49,7 +49,3 @@ class ToolDefinition(ABC):
         if name == "execute" or getattr(self, "_frozen", False):
             raise AttributeError(f"Tool '{self.__class__.__name__}' cannot be modified after registration.")
         super().__delattr__(name)
-
-    @abstractmethod
-    def execute(self, context: ConversationContext, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedError

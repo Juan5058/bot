@@ -3,22 +3,34 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
-
-_SENSITIVE_PARAMETER_KEY_PARTS = (
-    "secret",
-    "token",
-    "password",
-    "api_key",
-    "access_key",
-    "credential",
-    "biometric",
-)
 
 _MAX_PARAMETER_DEPTH = 32
 _MAX_CONTAINER_ITEMS = 256
 _MAX_PARAMETER_NODES = 2048
+_MAX_PARAMETER_STRING_LENGTH = 8000
 MAX_USER_INPUT_LENGTH = 8000
+MAX_INFORMATIONAL_RESPONSE_LENGTH = 16000
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RequestEnvelope:
+    text: str = field(repr=False)
+    request_id: str = field(default_factory=lambda: uuid4().hex, init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.text) is not str:
+            raise TypeError("Request text must be a string.")
+        if len(self.text) > MAX_USER_INPUT_LENGTH:
+            raise ValueError(
+                f"Request text cannot exceed {MAX_USER_INPUT_LENGTH} characters."
+            )
+        if not self.text.strip():
+            raise ValueError("Request text cannot be empty.")
+
+    def __repr__(self) -> str:
+        return "RequestEnvelope(<redacted>)"
 
 
 def validate_tool_parameters(parameters: Any) -> None:
@@ -40,7 +52,13 @@ def validate_tool_parameters(parameters: Any) -> None:
         if node_count > _MAX_PARAMETER_NODES:
             raise ValueError("Proposal parameters exceed the supported size.")
 
-        if value is None or type(value) in {str, bool, int}:
+        if type(value) is str:
+            if len(value) > _MAX_PARAMETER_STRING_LENGTH:
+                raise ValueError(
+                    "Proposal parameter strings exceed the supported length."
+                )
+            continue
+        if value is None or type(value) in {bool, int}:
             continue
         if type(value) is float:
             if not math.isfinite(value):
@@ -77,100 +95,12 @@ def validate_tool_parameters(parameters: Any) -> None:
                     raise TypeError(
                         "Proposal parameter keys must be strings."
                     )
+                if len(key) > _MAX_PARAMETER_STRING_LENGTH:
+                    raise ValueError(
+                        "Proposal parameter keys exceed the supported length."
+                    )
                 children.append(item)
         pending.extend((item, depth + 1, False) for item in reversed(children))
-
-
-def _serialize_parameter(
-    value: Any,
-    *,
-    depth: int = 0,
-    node_count: list[int] | None = None,
-) -> Any:
-    """
-    Serialize tool proposal parameters into a restricted JSON-compatible form.
-
-    Security properties:
-    - Rejects arbitrary Python objects.
-    - Rejects non-string dictionary keys.
-    - Rejects NaN and Infinity.
-    - Limits nesting depth.
-    - Limits the number of items in each container.
-    - Limits the total number of visited nodes.
-    - Redacts values belonging to keys that look sensitive.
-    - Handles recursive/cyclic structures through the depth/node limits.
-    """
-    if node_count is None:
-        node_count = [0]
-
-    node_count[0] += 1
-
-    if node_count[0] > _MAX_PARAMETER_NODES:
-        raise ValueError(
-            "Proposal parameters exceed the supported size."
-        )
-
-    if value is None or type(value) in {str, bool, int}:
-        return value
-
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError(
-                "Proposal parameters cannot contain non-finite numbers."
-            )
-        return value
-
-    if depth >= _MAX_PARAMETER_DEPTH:
-        raise ValueError(
-            "Proposal parameters exceed the supported nesting depth."
-        )
-
-    if type(value) is list:
-        if len(value) > _MAX_CONTAINER_ITEMS:
-            raise ValueError(
-                "Proposal parameter containers exceed the supported size."
-            )
-
-        return [
-            _serialize_parameter(
-                item,
-                depth=depth + 1,
-                node_count=node_count,
-            )
-            for item in value
-        ]
-
-    if type(value) is dict:
-        if len(value) > _MAX_CONTAINER_ITEMS:
-            raise ValueError(
-                "Proposal parameter containers exceed the supported size."
-            )
-
-        serialized: dict[str, Any] = {}
-
-        for key, item in value.items():
-            if type(key) is not str:
-                raise TypeError(
-                    "Proposal parameter keys must be strings."
-                )
-
-            if any(
-                part in key.lower()
-                for part in _SENSITIVE_PARAMETER_KEY_PARTS
-            ):
-                serialized[key] = "[REDACTED]"
-            else:
-                serialized[key] = _serialize_parameter(
-                    item,
-                    depth=depth + 1,
-                    node_count=node_count,
-                )
-
-        return serialized
-
-    raise TypeError(
-        "Proposal parameters must contain only JSON-compatible values."
-    )
 
 
 @dataclass(slots=True)
@@ -195,7 +125,7 @@ class ToolProposal:
         return "ToolProposal(<redacted>)"
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, repr=False)
 class ConversationResult:
     user_text: str = field(repr=False)
     intent: str
@@ -206,15 +136,28 @@ class ConversationResult:
         default=None,
         repr=False,
     )
+    informational_response: str | None = field(
+        default=None,
+        repr=False,
+    )
     error: str | None = field(
         default=None,
         repr=False,
     )
     audit_id: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        proposal_data = None
+    def __repr__(self) -> str:
+        return "ConversationResult(<redacted>)"
 
+    def to_dict(self) -> dict[str, Any]:
+        if type(self.authorized) is not bool:
+            raise TypeError("Conversation result authorization status is invalid.")
+        if type(self.success) is not bool:
+            raise TypeError("Conversation result status is invalid.")
+        if type(self.intent) is not str:
+            raise TypeError("Conversation result intent is invalid.")
+        if self.intent not in {"text_request", "unknown"}:
+            raise ValueError("Conversation result intent is unsupported.")
         if self.proposal is not None:
             if type(self.proposal) is not ToolProposal:
                 raise TypeError(
@@ -234,25 +177,119 @@ class ConversationResult:
                 raise TypeError(
                     "Conversation result proposal has invalid fields."
                 )
+            validate_tool_parameters(proposal.parameters)
 
-            proposal_data = {
-                "tool_name": proposal.tool_name,
-                "parameters": _serialize_parameter(
-                    proposal.parameters
-                ),
-                "permission": proposal.permission,
-                "risk_level": proposal.risk_level,
-                "requires_confirmation": proposal.requires_confirmation,
-                "action_ref": proposal.action_ref,
+        if (
+            type(self.user_text) is not str
+            or len(self.user_text) > MAX_USER_INPUT_LENGTH
+        ):
+            raise TypeError("Conversation result user text is invalid.")
+        if self.success and self.error is not None:
+            raise ValueError("Successful conversation results cannot contain an error.")
+        if self.success and self.proposal is not None and self.tool_result is None:
+            raise ValueError(
+                "Successful tool proposals must include an execution result."
+            )
+        if self.informational_response is not None:
+            if (
+                type(self.informational_response) is not str
+                or not self.informational_response.strip()
+                or len(self.informational_response)
+                > MAX_INFORMATIONAL_RESPONSE_LENGTH
+                or any(
+                    ord(character) < 32 and character not in "\t\n\r"
+                    for character in self.informational_response
+                )
+                or "\x7f" in self.informational_response
+            ):
+                raise ValueError("Informational response is invalid.")
+            if (
+                not self.success
+                or self.authorized
+                or self.proposal is not None
+                or self.tool_result is not None
+                or self.error is not None
+            ):
+                raise ValueError(
+                    "Informational responses cannot represent authorized tool execution."
+                )
+        error_messages = {
+            "Request could not be processed.",
+            "Request was denied.",
+            "Tool execution failed.",
+            "Please provide a message after 'repite:' or 'echo:'.",
+            "Please provide text after 'pregunta:' or 'resumen:'.",
+            "Use 'repite: <message>' or 'echo: <message>' for a supported request.",
+            "This request requires generative processing, which is unavailable.",
+            "Informative processing is unavailable.",
+            "Informative response could not be generated.",
+            "Please provide search text after 'web:' or 'busca en Internet:'.",
+            "Internet search is unavailable.",
+        }
+        if self.error is not None and type(self.error) is not str:
+            raise TypeError("Conversation result error is invalid.")
+        error = (
+            self.error
+            if self.error in error_messages
+            else "Request could not be processed."
+            if self.error is not None
+            else None
+        )
+
+        public_tool_result = None
+        if self.tool_result is not None:
+            if (
+                type(self.tool_result) is not dict
+                or any(type(key) is not str for key in self.tool_result)
+                or set(self.tool_result)
+                != {"tool_name", "status", "result"}
+            ):
+                raise ValueError(
+                    "Conversation result contains an invalid public tool result."
+                )
+            if (
+                type(self.tool_result["tool_name"]) is not str
+                or self.tool_result["tool_name"] != "echo_message"
+                or type(self.tool_result["status"]) is not str
+                or self.tool_result["status"] != "simulated_ok"
+                or type(self.tool_result["result"]) is not dict
+            ):
+                raise ValueError(
+                    "Conversation result contains an invalid public tool result."
+                )
+            echo_result = self.tool_result["result"]
+            if (
+                any(type(key) is not str for key in echo_result)
+                or set(echo_result)
+                != {"kind", "message", "status", "execution_mode"}
+                or type(echo_result["kind"]) is not str
+                or echo_result["kind"] != "simulated_echo"
+                or type(echo_result["message"]) is not str
+                or len(echo_result["message"]) > _MAX_PARAMETER_STRING_LENGTH
+                or type(echo_result["status"]) is not str
+                or echo_result["status"] != "ok"
+                or type(echo_result["execution_mode"]) is not str
+                or echo_result["execution_mode"] != "simulated"
+            ):
+                raise ValueError(
+                    "Conversation result contains an invalid public tool result."
+                )
+            if not self.success:
+                raise ValueError(
+                    "Failed conversation results cannot contain a successful tool result."
+                )
+            public_tool_result = {
+                "status": "simulated_ok",
+                "message": echo_result["message"],
             }
 
-        return {
+        public_result = {
             "user_text": self.user_text,
             "intent": self.intent,
-            "proposal": proposal_data,
-            "authorized": self.authorized,
             "success": self.success,
-            "tool_result": self.tool_result,
-            "error": self.error,
-            "audit_id": self.audit_id,
+            "tool_result": public_tool_result,
+            "error": error,
         }
+        if self.informational_response is not None:
+            public_result["response"] = self.informational_response
+        return public_result

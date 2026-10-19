@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from jarvis.ai.contracts import AIProviderContract
-from jarvis.conversation.models import ToolProposal
-from jarvis.core.context import ConversationContext
+from jarvis.ai.contracts import (
+    AIProviderContract,
+    ActionSuggestion,
+    InformationalRequest,
+    InformationalResponse,
+)
 
 
 class SimulatedAIProvider(AIProviderContract):
@@ -16,25 +19,22 @@ class SimulatedAIProvider(AIProviderContract):
             "normalized_text": text,
         }
 
-    def propose_action(self, user_text: str, context: ConversationContext) -> ToolProposal:
+    def propose_action(self, user_text: str) -> ActionSuggestion:
         text = (user_text or "").strip()
-        if not text:
-            return ToolProposal(
-                tool_name="echo_message",
-                parameters={"message": ""},
-                permission="tool.echo_message",
-                risk_level="low",
-                requires_confirmation=False,
-                action_ref="empty_input",
-            )
-        return ToolProposal(
+        return ActionSuggestion(
             tool_name="echo_message",
             parameters={"message": text},
-            permission="tool.echo_message",
-            risk_level="low",
-            requires_confirmation=False,
-            action_ref=f"echo:{context.trace_id}",
         )
 
-    def respond(self, user_text: str, context: ConversationContext) -> str:
+    def respond(self, user_text: str) -> str:
         return f"Respuesta simulada para: {user_text}"
+
+    def respond_informational(
+        self,
+        request: InformationalRequest,
+    ) -> InformationalResponse:
+        if type(request) is not InformationalRequest:
+            raise TypeError("The simulated provider requires an informational request.")
+        return InformationalResponse(
+            text=f"Respuesta simulada para: {request.content}"
+        )

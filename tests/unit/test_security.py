@@ -1,12 +1,20 @@
 import pytest
+import jarvis.tools.runner as runner_module
 
+from jarvis.ai.contracts import ActionSuggestion
 from jarvis.ai.simulator import SimulatedAIProvider
 from jarvis.app import create_application
 from jarvis.config.settings import Settings
 from jarvis.conversation.models import ConversationResult, ToolProposal
 from jarvis.core.context import ConversationContext
-from jarvis.core.errors import InvalidInputError, ToolNotRegisteredError
-from jarvis.security.audit import AuditLogger
+from jarvis.core.errors import (
+    AuditLoggingError,
+    InvalidInputError,
+    PostExecutionAuditError,
+    PreExecutionAuditError,
+    ToolNotRegisteredError,
+)
+from jarvis.security.audit import AuditLogger, MAX_AUDIT_ENTRIES
 from jarvis.security.authorization import AuthorizationService
 from jarvis.security.policy import SecurityPolicy
 from jarvis.tools.registry import EchoTool, ToolRegistry, create_default_registry
@@ -19,6 +27,7 @@ def _use_policy_for_test(app, policy: SecurityPolicy) -> None:
     app.tool_runner = SimulatedToolRunner(
         registry=app.registry,
         authorization_service=authorizer,
+        audit_logger=app.audit_logger,
     )
 
 
@@ -269,6 +278,67 @@ def test_audit_log_returns_defensive_copies() -> None:
     assert logger.entries[0]["details"]["authorization"] == "granted"
 
 
+def test_audit_log_retention_is_bounded_and_fifo() -> None:
+    retention_limit = MAX_AUDIT_ENTRIES
+    logger = AuditLogger()
+
+    assert retention_limit == 1024
+
+    for index in range(retention_limit + 3):
+        logger.log(
+            session_id=f"session-{index:08x}",
+            action_ref="empty_input",
+            outcome="allowed",
+            details={"authorization": "granted", "user_text": "private-marker"},
+        )
+
+    entries = logger.entries
+
+    assert len(entries) == retention_limit
+    assert entries[0]["session_id"] == "session-00000003"
+    assert entries[-1]["session_id"] == f"session-{retention_limit + 2:08x}"
+    assert all("user_text" not in entry["details"] for entry in entries)
+    assert "private-marker" not in str(entries)
+
+
+def test_audit_log_appends_without_replacing_storage_collection() -> None:
+    logger = AuditLogger()
+    storage = logger._entries
+
+    logger.log(
+        session_id="session-00000001",
+        action_ref="empty_input",
+        outcome="allowed",
+        details={},
+    )
+
+    assert logger._entries is storage
+
+
+def test_audit_logger_state_cannot_be_replaced_through_instance_dictionary() -> None:
+    logger = AuditLogger()
+
+    assert not hasattr(logger, "__dict__")
+    with pytest.raises(AttributeError):
+        _ = logger.__dict__
+    with pytest.raises(AttributeError):
+        logger._entries = ()
+    with pytest.raises(AttributeError):
+        del logger._entries
+
+    entry = logger.log(
+        session_id="session-12345678",
+        action_ref="echo:0123456789ab",
+        outcome="allowed",
+        details={"authorization": "granted"},
+    )
+    assert logger.entries == [entry]
+    with pytest.raises(TypeError):
+        logger._entries[0]["outcome"] = "denied"
+    with pytest.raises(TypeError):
+        logger._entries[0]["details"]["authorization"] = "denied"
+
+
 def test_audit_rejects_invalid_values_and_bounds_identifiers() -> None:
     logger = AuditLogger()
     marker = "invalid-audit-value-marker"
@@ -332,17 +402,17 @@ def test_conversation_result_serializes_slotted_proposal_without_secrets() -> No
 
     serialized = result.to_dict()
 
-    assert serialized["proposal"] == {
-        "tool_name": "echo_message",
-        "parameters": {
-            "message": "hello",
-            "credentials": "[REDACTED]",
-        },
-        "permission": "tool.echo_message",
-        "risk_level": "low",
-        "requires_confirmation": False,
-        "action_ref": "echo:0123456789ab",
+    assert set(serialized) == {
+        "user_text",
+        "intent",
+        "success",
+        "tool_result",
+        "error",
     }
+    assert "proposal" not in serialized
+    assert "permission" not in serialized
+    assert "risk_level" not in serialized
+    assert "action_ref" not in serialized
     assert secret not in str(serialized)
     assert secret not in repr(proposal)
 
@@ -355,7 +425,187 @@ def test_conversation_result_serializes_missing_proposal() -> None:
         authorized=False,
         success=False,
     )
-    assert result.to_dict()["proposal"] is None
+    assert "proposal" not in result.to_dict()
+
+
+def test_conversation_result_repr_does_not_expose_private_fields() -> None:
+    markers = (
+        "user-text-private-marker",
+        "proposal-private-marker",
+        "error-private-marker",
+        "tool.permission-private-marker",
+        "audit-id-private-marker",
+    )
+    result = ConversationResult(
+        user_text=markers[0],
+        intent=markers[1],
+        proposal=ToolProposal(
+            tool_name="echo_message",
+            parameters={"message": markers[1]},
+            permission=markers[3],
+            action_ref=markers[1],
+        ),
+        authorized=True,
+        success=False,
+        error=markers[2],
+        audit_id=markers[4],
+    )
+
+    representation = repr(result)
+
+    assert representation == "ConversationResult(<redacted>)"
+    assert all(marker not in representation for marker in markers)
+
+
+def test_public_result_replaces_unrecognized_error_text() -> None:
+    marker = "possible-secret-error-marker"
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=False,
+        success=False,
+        error=marker,
+        audit_id="session-private-id",
+    )
+
+    serialized = result.to_dict()
+
+    assert serialized["error"] == "Request could not be processed."
+    assert marker not in str(serialized)
+    assert "audit_id" not in serialized
+    assert "session-private-id" not in str(serialized)
+
+
+@pytest.mark.parametrize("authorized", ("yes", 1))
+def test_conversation_result_rejects_non_boolean_authorization_status(
+    authorized,
+) -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=authorized,
+        success=False,
+    )
+
+    with pytest.raises(TypeError, match="authorization status"):
+        result.to_dict()
+
+
+@pytest.mark.parametrize("success", (0, 1, "yes"))
+def test_conversation_result_rejects_non_boolean_success_status(success) -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=False,
+        success=success,
+    )
+
+    with pytest.raises(TypeError, match="status"):
+        result.to_dict()
+
+
+@pytest.mark.parametrize("intent", (None, 1, "unsupported"))
+def test_conversation_result_rejects_invalid_intent(intent) -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent=intent,
+        proposal=None,
+        authorized=False,
+        success=False,
+    )
+
+    with pytest.raises((TypeError, ValueError), match="intent"):
+        result.to_dict()
+
+
+def test_conversation_result_rejects_success_with_error() -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=True,
+        success=True,
+        error="Request was denied.",
+    )
+
+    with pytest.raises(ValueError, match="cannot contain an error"):
+        result.to_dict()
+
+
+def test_conversation_result_rejects_failure_with_successful_tool_result() -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=True,
+        success=False,
+        tool_result={
+            "tool_name": "echo_message",
+            "status": "simulated_ok",
+            "result": {
+                "kind": "simulated_echo",
+                "message": "hello",
+                "status": "ok",
+                "execution_mode": "simulated",
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="Failed conversation results"):
+        result.to_dict()
+
+
+def test_conversation_result_rejects_successful_proposal_without_result() -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=ToolProposal(tool_name="echo_message"),
+        authorized=True,
+        success=True,
+    )
+
+    with pytest.raises(ValueError, match="must include an execution result"):
+        result.to_dict()
+
+
+def test_conversation_result_allows_success_without_tool_proposal() -> None:
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=False,
+        success=True,
+    )
+
+    serialized = result.to_dict()
+
+    assert serialized["success"] is True
+    assert serialized["tool_result"] is None
+    assert serialized["error"] is None
+
+
+def test_public_result_rejects_unknown_tool_output_without_echoing_it() -> None:
+    marker = "possible-secret-result-marker"
+    result = ConversationResult(
+        user_text="hello",
+        intent="text_request",
+        proposal=None,
+        authorized=True,
+        success=True,
+        tool_result={
+            "tool_name": "echo_message",
+            "status": "simulated_ok",
+            "result": {"secret": marker},
+        },
+    )
+
+    with pytest.raises(ValueError) as error:
+        result.to_dict()
+
+    assert marker not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -396,7 +646,7 @@ def test_conversation_result_parameter_depth_limit() -> None:
         authorized=False,
         success=False,
     )
-    assert accepted.to_dict()["proposal"]["parameters"]["nested"] == within_limit
+    assert "proposal" not in accepted.to_dict()
 
     exceeds_limit = "value"
     for _ in range(32):
@@ -427,7 +677,7 @@ def test_conversation_result_parameter_container_item_limit() -> None:
         authorized=False,
         success=False,
     )
-    assert len(accepted_list.to_dict()["proposal"]["parameters"]["items"]) == 256
+    assert "proposal" not in accepted_list.to_dict()
 
     rejected_list = ConversationResult(
         user_text="hello",
@@ -452,7 +702,7 @@ def test_conversation_result_parameter_container_item_limit() -> None:
         authorized=False,
         success=False,
     )
-    assert len(accepted_dict.to_dict()["proposal"]["parameters"]) == 256
+    assert "proposal" not in accepted_dict.to_dict()
 
     rejected_dict = ConversationResult(
         user_text="hello",
@@ -502,7 +752,7 @@ def test_conversation_result_rejects_cyclic_parameters_without_recursion_error()
         success=False,
     )
 
-    with pytest.raises(ValueError, match="nesting depth"):
+    with pytest.raises(ValueError, match="cycles"):
         result.to_dict()
 
 
@@ -523,7 +773,7 @@ def test_conversation_result_rejects_non_finite_parameter_numbers(value) -> None
         result.to_dict()
 
 
-def test_conversation_result_redacts_sensitive_parameter_keys() -> None:
+def test_conversation_result_does_not_expose_proposal_parameters() -> None:
     secrets = {
         "password": "pw-marker-91",
         "api_key": "key-marker-82",
@@ -543,21 +793,26 @@ def test_conversation_result_redacts_sensitive_parameter_keys() -> None:
         success=False,
     )
 
-    serialized = result.to_dict()["proposal"]["parameters"]
+    serialized = result.to_dict()
 
-    assert serialized == {key: "[REDACTED]" for key in secrets}
+    assert "proposal" not in serialized
     assert all(secret not in str(serialized) for secret in secrets.values())
 
 
 def test_pipeline_audit_keeps_only_allowlisted_metadata() -> None:
     marker = "pipeline-result-private-marker"
     app = create_application(Settings(mode="simulated", ai_enabled=False))
-    result = app.process(marker)
+    result = app.process(f"repite: {marker}")
 
     assert result.success is True
     assert marker not in str(app.audit_logger.entries)
-    assert app.audit_logger.entries[0]["outcome"] == "allowed"
     assert app.audit_logger.entries[0]["details"] == {
+        "authorization": "granted",
+        "execution_status": "authorized",
+        "tool_name": "echo_message",
+    }
+    assert app.audit_logger.entries[-1]["outcome"] == "allowed"
+    assert app.audit_logger.entries[-1]["details"] == {
         "authorization": "granted",
         "execution_status": "completed",
         "result_code": "simulated_ok",
@@ -569,17 +824,18 @@ def test_pipeline_does_not_audit_exception_messages(monkeypatch) -> None:
     marker = "exception-private-marker"
     app = create_application(Settings(mode="simulated", ai_enabled=False))
 
-    def fail_with_sensitive_message(self, *args, **kwargs):
+    def fail_with_sensitive_message(*args, **kwargs):
         raise RuntimeError(marker)
 
-    monkeypatch.setattr(EchoTool, "execute", fail_with_sensitive_message)
-    result = app.process("hello")
+    monkeypatch.setattr(runner_module, "_execute_echo_message", fail_with_sensitive_message)
+    result = app.process("repite: hello")
 
     assert result.success is False
     assert result.error == "Tool execution failed."
     assert marker not in str(app.audit_logger.entries)
-    assert app.audit_logger.entries[0]["outcome"] == "error"
-    assert app.audit_logger.entries[0]["details"] == {
+    assert app.audit_logger.entries[0]["details"]["execution_status"] == "authorized"
+    assert app.audit_logger.entries[-1]["outcome"] == "error"
+    assert app.audit_logger.entries[-1]["details"] == {
         "authorization": "granted",
         "execution_status": "error",
         "error_code": "tool_execution_failed",
@@ -592,13 +848,13 @@ def test_pipeline_denial_audit_preserves_operational_metadata(monkeypatch) -> No
     _use_policy_for_test(app, SecurityPolicy())
     calls = {"count": 0}
 
-    def count_if_called(self, context, **kwargs):
+    def count_if_called(context, **kwargs):
         calls["count"] += 1
         return {"status": "unexpected"}
 
-    monkeypatch.setattr(EchoTool, "execute", count_if_called)
+    monkeypatch.setattr(runner_module, "_execute_echo_message", count_if_called)
 
-    result = app.process("hello")
+    result = app.process("repite: hello")
 
     assert result.authorized is False
     assert result.success is False
@@ -617,134 +873,195 @@ def test_audit_failure_does_not_allow_a_denied_tool(monkeypatch) -> None:
     _use_policy_for_test(app, SecurityPolicy())
     calls = {"count": 0}
 
-    def count_if_called(self, context, **kwargs):
+    def count_if_called(context, **kwargs):
         calls["count"] += 1
         return {"status": "unexpected"}
 
-    def fail_audit(**kwargs):
-        raise RuntimeError("audit unavailable")
+    def fail_audit(self, **kwargs):
+        raise RuntimeError("private audit logger detail")
 
-    monkeypatch.setattr(EchoTool, "execute", count_if_called)
-    monkeypatch.setattr(app.audit_logger, "log", fail_audit)
+    monkeypatch.setattr(runner_module, "_execute_echo_message", count_if_called)
+    monkeypatch.setattr(AuditLogger, "log", fail_audit)
 
-    with pytest.raises(RuntimeError, match="audit unavailable"):
-        app.process("hello")
+    with pytest.raises(AuditLoggingError) as error:
+        app.process("repite: hello")
+    assert "private audit logger detail" not in str(error.value)
     assert calls["count"] == 0
 
 
-def test_ai_provider_context_mutation_is_denied_and_restored(monkeypatch) -> None:
+def test_authorized_audit_failure_stops_before_tool_execution(monkeypatch) -> None:
     app = create_application(Settings(mode="simulated", ai_enabled=False))
-    simulator = SimulatedAIProvider()
     calls = {"count": 0}
-    contexts = []
+    private_marker = "private-audit-failure-marker"
 
-    def counted_echo(self, context, **kwargs):
+    def count_executor(context, **kwargs):
         calls["count"] += 1
         return {"status": "unexpected"}
+
+    def fail_audit(self, **kwargs):
+        raise RuntimeError(private_marker)
+
+    monkeypatch.setattr(runner_module, "_execute_echo_message", count_executor)
+    monkeypatch.setattr(AuditLogger, "log", fail_audit)
+
+    with pytest.raises(PreExecutionAuditError) as error:
+        app.process("repite: hello")
+
+    assert private_marker not in str(error.value)
+    assert calls["count"] == 0
+
+
+def test_authorized_audit_event_precedes_tool_dispatch(monkeypatch) -> None:
+    app = create_application(Settings(mode="simulated", ai_enabled=False))
+    observed = {}
+
+    def inspect_prior_audit(context, **kwargs):
+        entries = app.audit_logger.entries
+        observed["entry"] = entries[-1]
+        return {
+            "kind": "simulated_echo",
+            "message": kwargs["message"],
+            "status": "ok",
+            "execution_mode": "simulated",
+        }
+
+    monkeypatch.setattr(
+        runner_module,
+        "_execute_echo_message",
+        inspect_prior_audit,
+    )
+
+    result = app.process("repite: hello")
+
+    assert result.success is True
+    assert observed["entry"]["outcome"] == "allowed"
+    assert observed["entry"]["details"] == {
+        "authorization": "granted",
+        "execution_status": "authorized",
+        "tool_name": "echo_message",
+    }
+    assert app.audit_logger.entries[-1]["details"]["execution_status"] == "completed"
+
+
+def test_post_execution_audit_failure_is_explicit_and_does_not_retry(
+    monkeypatch,
+) -> None:
+    app = create_application(Settings(mode="simulated", ai_enabled=False))
+    calls = {"count": 0}
+    private_marker = "private-post-audit-failure-marker"
+    original_log = AuditLogger.log
+
+    def count_executor(context, **kwargs):
+        calls["count"] += 1
+        return {
+            "kind": "simulated_echo",
+            "message": kwargs["message"],
+            "status": "ok",
+            "execution_mode": "simulated",
+        }
+
+    def fail_completed_audit(self, **kwargs):
+        details = kwargs.get("details", {})
+        if details.get("execution_status") == "completed":
+            raise RuntimeError(private_marker)
+        return original_log(self, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_execute_echo_message", count_executor)
+    monkeypatch.setattr(AuditLogger, "log", fail_completed_audit)
+
+    with pytest.raises(PostExecutionAuditError) as error:
+        app.process("repite: hello")
+
+    assert "may have executed" in str(error.value)
+    assert private_marker not in str(error.value)
+    assert calls["count"] == 1
+    assert [
+        entry["details"]["execution_status"]
+        for entry in app.audit_logger.entries
+    ] == ["authorized"]
+
+
+def test_configured_provider_cannot_override_route_or_set_authority() -> None:
+    app = create_application(Settings(mode="simulated", ai_enabled=False))
+    calls = {"classify": 0, "propose": 0, "respond": 0}
 
     class MutatingProvider:
         def classify_intent(self, user_text):
-            return simulator.classify_intent(user_text)
+            calls["classify"] += 1
+            return {"intent": "admin_request"}
 
-        def propose_action(self, user_text, context):
-            contexts.append(context)
-            context.mode = "real"
-            context.session_id = "attacker-session"
-            context.confirmed_actions.add("forged-action")
-            context.claims["identity_verified"] = True
-            return simulator.propose_action(user_text, context)
+        def propose_action(self, user_text):
+            calls["propose"] += 1
+            return ActionSuggestion(
+                "echo_message",
+                {"message": user_text, "permission": "tool.admin"},
+            )
 
-        def respond(self, user_text, context):
-            return simulator.respond(user_text, context)
+        def respond(self, user_text):
+            calls["respond"] += 1
+            return "provider-controlled result"
 
-    monkeypatch.setattr(EchoTool, "execute", counted_echo)
     app.ai_provider = MutatingProvider()
-    result = app.process("hello")
+    result = app.process("repite: hello")
 
-    assert result.success is False
-    assert result.authorized is False
-    assert contexts[0].mode == "simulated"
-    assert contexts[0].session_id == app.audit_logger.entries[0]["session_id"]
-    assert contexts[0].claims == {}
-    assert contexts[0].confirmed_actions == set()
-    assert calls["count"] == 0
-    assert app.audit_logger.entries[0]["action_ref"].startswith("echo:")
-    assert app.audit_logger.entries[0]["details"]["reason"] == "invalid_proposal"
+    assert result.success is True
+    assert result.proposal is not None
+    assert result.proposal.permission == "tool.echo_message"
+    assert result.proposal.risk_level == "low"
+    assert result.proposal.requires_confirmation is False
+    assert result.tool_result["result"]["message"] == "hello"
+    assert calls == {"classify": 0, "propose": 0, "respond": 0}
+    assert not hasattr(ActionSuggestion("echo_message", {}), "permission")
+    assert not hasattr(ActionSuggestion("echo_message", {}), "confirmation_token")
+    assert app.audit_logger.entries[0]["action_ref"] == result.proposal.action_ref
 
 
-def test_pipeline_uses_one_context_for_proposal_and_execution(monkeypatch) -> None:
+def test_runner_receives_pipeline_context_for_explicit_echo(monkeypatch) -> None:
     app = create_application(Settings(mode="simulated", ai_enabled=False))
-    simulated_provider = SimulatedAIProvider()
     observed = {}
-
-    class TrackingProvider:
-        def classify_intent(self, user_text):
-            observed["classified_text"] = user_text
-            return simulated_provider.classify_intent(user_text)
-
-        def propose_action(self, user_text, context):
-            observed["proposal_context"] = context
-            return simulated_provider.propose_action(user_text, context)
-
-        def respond(self, user_text, context):
-            return simulated_provider.respond(user_text, context)
-
-    app.ai_provider = TrackingProvider()
     execute = app.tool_runner.execute
 
-    def track_execute(proposal, context):
+    def track_execute(self, proposal, context):
         observed["execution_context"] = context
         return execute(proposal, context)
 
-    monkeypatch.setattr(app.tool_runner, "execute", track_execute)
-    result = app.process("hello")
+    monkeypatch.setattr(type(app.tool_runner), "execute", track_execute)
+    result = app.process("repite: hello")
 
-    context = observed["proposal_context"]
     assert result.success is True
-    assert observed["classified_text"] == context.user_text == "hello"
-    assert observed["execution_context"] is context
-    assert app.audit_logger.entries[0]["session_id"] == context.session_id
-    assert app.audit_logger.entries[0]["action_ref"] == f"echo:{context.trace_id}"
+    assert observed["execution_context"].user_text == "repite: hello"
+    assert app.audit_logger.entries[0]["session_id"] == observed["execution_context"].session_id
+    assert app.audit_logger.entries[0]["action_ref"] == (
+        f"echo:{observed['execution_context'].trace_id}"
+    )
 
 
-def test_malformed_provider_proposal_is_denied_without_leaking_data() -> None:
-    marker = "malformed-proposal-private-marker"
+def test_unsupported_windows_command_is_denied_without_dispatch() -> None:
     app = create_application(Settings(mode="simulated", ai_enabled=False))
-
-    class MalformedProvider:
-        def classify_intent(self, user_text):
-            return {"intent": "text_request"}
-
-        def propose_action(self, user_text, context):
-            return {"tool_name": marker, "permission": "tool.echo_message"}
-
-        def respond(self, user_text, context):
-            return marker
-
-    app.ai_provider = MalformedProvider()
-    result = app.process("hello")
+    result = app.process("open notepad")
 
     assert result.success is False
     assert result.authorized is False
+    assert result.proposal is None
     assert result.error == "Request was denied."
-    assert marker not in str(app.audit_logger.entries)
-    assert app.audit_logger.entries[0]["outcome"] == "denied"
+    assert app.audit_logger.entries == []
 
 
 def test_pipeline_rejects_invalid_user_input_before_provider_invocation() -> None:
     app = create_application(Settings(mode="simulated", ai_enabled=False))
-    calls = {"classify": 0, "propose": 0}
+    calls = {"classify": 0, "propose": 0, "respond": 0}
 
     class CountingProvider:
         def classify_intent(self, user_text):
             calls["classify"] += 1
             return {"intent": "text_request"}
 
-        def propose_action(self, user_text, context):
+        def propose_action(self, user_text):
             calls["propose"] += 1
-            return SimulatedAIProvider().propose_action(user_text, context)
+            return SimulatedAIProvider().propose_action(user_text)
 
-        def respond(self, user_text, context):
+        def respond(self, user_text):
+            calls["respond"] += 1
             return user_text
 
     app.ai_provider = CountingProvider()
@@ -757,93 +1074,24 @@ def test_pipeline_rejects_invalid_user_input_before_provider_invocation() -> Non
     with pytest.raises(InvalidInputError, match="8000 characters"):
         app.process("x" * 8001)
 
-    assert calls == {"classify": 0, "propose": 0}
+    assert calls == {"classify": 0, "propose": 0, "respond": 0}
 
 
 def test_pipeline_accepts_user_input_at_the_maximum_length() -> None:
     app = create_application(Settings(mode="simulated", ai_enabled=False))
+    message = "x" * (8000 - len("repite: "))
 
-    result = app.process("x" * 8000)
+    result = app.process(f"repite: {message}")
 
     assert result.success is True
     assert result.tool_result is not None
-    assert len(result.tool_result["result"]["message"]) == 8000
+    assert len(result.tool_result["result"]["message"]) == len(message)
 
 
-@pytest.mark.parametrize(
-    "classification",
-    (
-        None,
-        [],
-        {},
-        {"intent": None},
-        {"intent": 1},
-        {"intent": "not_a_supported_intent"},
-        {"intent": "unknown"},
-    ),
-)
-def test_pipeline_denies_invalid_classification_before_proposal(
-    monkeypatch,
-    classification,
-) -> None:
-    app = create_application(Settings(mode="simulated", ai_enabled=False))
-    calls = {"propose": 0, "execute": 0}
-
-    class ClassifyingProvider:
-        def classify_intent(self, user_text):
-            return classification
-
-        def propose_action(self, user_text, context):
-            calls["propose"] += 1
-            return SimulatedAIProvider().propose_action(user_text, context)
-
-        def respond(self, user_text, context):
-            return user_text
-
-    def count_execution(self, context, **kwargs):
-        calls["execute"] += 1
-        return {"status": "unexpected"}
-
-    monkeypatch.setattr(EchoTool, "execute", count_execution)
-    app.ai_provider = ClassifyingProvider()
-
-    result = app.process("hello")
-
-    assert result.success is False
-    assert result.authorized is False
-    assert result.intent == "unknown"
-    assert calls == {"propose": 0, "execute": 0}
-    assert app.audit_logger.entries[0]["details"]["reason"] == "invalid_classification"
-
-
-def test_pipeline_denies_classification_with_non_string_key(monkeypatch) -> None:
-    app = create_application(Settings(mode="simulated", ai_enabled=False))
-    calls = {"propose": 0}
-
-    class MalformedClassificationProvider:
-        def classify_intent(self, user_text):
-            return {"intent": "text_request", 1: "unexpected"}
-
-        def propose_action(self, user_text, context):
-            calls["propose"] += 1
-            return SimulatedAIProvider().propose_action(user_text, context)
-
-        def respond(self, user_text, context):
-            return user_text
-
-    app.ai_provider = MalformedClassificationProvider()
-    result = app.process("hello")
-
-    assert result.success is False
-    assert result.authorized is False
-    assert calls["propose"] == 0
-    assert app.audit_logger.entries[0]["details"]["reason"] == "invalid_classification"
-
-
-def test_pipeline_accepts_supported_text_request_classification() -> None:
+def test_pipeline_accepts_supported_explicit_echo_route() -> None:
     app = create_application(Settings(mode="simulated", ai_enabled=False))
 
-    result = app.process("hello")
+    result = app.process("repite: hello")
 
     assert result.intent == "text_request"
     assert result.success is True

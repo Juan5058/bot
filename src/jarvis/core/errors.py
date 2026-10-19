@@ -22,5 +22,27 @@ class ToolExecutionError(JARVISCoreError):
     """A registered simulated tool failed during execution."""
 
 
+class AuditLoggingError(JARVISCoreError):
+    """A required audit event could not be recorded."""
+
+
+class PreExecutionAuditError(AuditLoggingError):
+    """Dispatch stopped because the authorization event was not recorded."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Tool execution was stopped because authorization could not be audited."
+        )
+
+
+class PostExecutionAuditError(AuditLoggingError):
+    """A tool may have executed, but its outcome could not be recorded."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The tool may have executed, but its outcome could not be audited."
+        )
+
+
 class InvalidInputError(JARVISCoreError):
     """User input cannot be processed safely."""

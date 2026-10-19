@@ -17,6 +17,8 @@ _RISK_LEVELS = frozenset({"low", "medium", "high"})
 
 
 class AuthorizationService:
+    __slots__ = ("policy", "_registry")
+
     def __setattr__(self, name: str, value: object) -> None:
         if name in {"policy", "_registry"} and hasattr(self, name):
             raise AttributeError(f"{name} is immutable after authorization service construction.")
@@ -78,8 +80,11 @@ class AuthorizationService:
 
         try:
             permission = validate_permission_name(proposal.permission)
-            tool = self.registry.get(proposal.tool_name)
             trusted_definition = self.registry.get_trusted_definition(proposal.tool_name)
+            self.registry.validate_tool_arguments(
+                proposal.tool_name,
+                proposal.parameters,
+            )
         except ToolNotRegisteredError:
             raise
         except (TypeError, ValueError, KeyError):
@@ -88,21 +93,12 @@ class AuthorizationService:
             return False
 
         if (
-            type(tool) is not trusted_definition.implementation_type
-            or type(tool.name) is not str
-            or tool.name != proposal.tool_name
-            or type(trusted_definition.required_permission) is not str
+            type(trusted_definition.required_permission) is not str
             or type(trusted_definition.execution_mode) is not str
             or trusted_definition.execution_mode != "simulated"
             or trusted_definition.risk_level not in _RISK_LEVELS
-            or tool.required_permission != trusted_definition.required_permission
-            or tool.execution_mode != trusted_definition.execution_mode
-            or tool.risk_level != trusted_definition.risk_level
-            or tool.requires_confirmation != trusted_definition.requires_confirmation
             or proposal.risk_level != trusted_definition.risk_level
             or proposal.requires_confirmation != trusted_definition.requires_confirmation
-            or type(tool._frozen) is not bool
-            or not tool._frozen
         ):
             return False
 
