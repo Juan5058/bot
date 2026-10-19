@@ -278,6 +278,92 @@ def test_backend_uses_ollama_load_infer_and_confirmed_unload_protocol() -> None:
     assert backend.failed_load_released(OLLAMA_MANAGER_MODEL_ID) is True
 
 
+def test_ollama_inference_returns_only_response_when_thinking_is_present() -> None:
+    thinking_marker = "PRIVATE_THINKING_MARKER_7f3a"
+    final_response = "Esta es la respuesta final en español."
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                _response({"model_info": {"general.architecture": "test"}}),
+                _response(
+                    {
+                        "done": True,
+                        "thinking": thinking_marker,
+                        "response": final_response,
+                    }
+                ),
+            ]
+        )
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    result = backend.infer(
+        handle,
+        LocalModelTask.ANSWER_QUESTION,
+        "Pregunta",
+        context_tokens=8,
+        max_context_tokens=128,
+    )
+
+    assert result == final_response
+    assert thinking_marker not in result
+
+
+def test_ollama_inference_errors_do_not_expose_thinking_text() -> None:
+    thinking_marker = "PRIVATE_THINKING_MARKER_a91c"
+    partial_response = "PRIVATE_PARTIAL_RESPONSE_MARKER_62de"
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                _response({"model_info": {"general.architecture": "test"}}),
+                _response(
+                    {
+                        "done": False,
+                        "thinking": thinking_marker,
+                        "response": partial_response,
+                    }
+                ),
+            ]
+        )
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "Pregunta",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert thinking_marker not in str(error.value)
+    assert partial_response not in str(error.value)
+
+
+def test_ollama_inference_accepts_response_without_thinking_field() -> None:
+    final_response = "Respuesta sin campo thinking."
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                _response({"model_info": {"general.architecture": "test"}}),
+                _response({"done": True, "response": final_response}),
+            ]
+        )
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    result = backend.infer(
+        handle,
+        LocalModelTask.ANSWER_QUESTION,
+        "Pregunta",
+        context_tokens=8,
+        max_context_tokens=128,
+    )
+
+    assert result == final_response
+
+
 @pytest.mark.parametrize(
     ("response", "error_type"),
     (
