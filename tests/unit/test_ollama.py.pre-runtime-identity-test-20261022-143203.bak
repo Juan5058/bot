@@ -1,0 +1,1990 @@
+from __future__ import annotations
+
+import json
+from io import BytesIO
+from pathlib import Path
+import sqlite3
+from threading import Event, Thread
+import tempfile
+from urllib.error import HTTPError
+from urllib.request import ProxyHandler, Request
+
+import pytest
+from pydantic import ValidationError
+
+from jarvis.ai.contracts import InformationalRequest
+from jarvis.ai.local_models import (
+    LocalModelDescriptor,
+    LocalModelLimits,
+    LocalModelManager,
+    LocalModelResourceError,
+    LocalModelTask,
+    LocalModelUnloadError,
+    ManagedLocalAIProvider,
+    ModelRequirements,
+    RemoteOperationLedger,
+    RemoteOperationOutcome,
+    ResourceSnapshot,
+    ResourceSource,
+)
+from jarvis.ai.model_catalog import (
+    ArtifactIdentity,
+    ModelCatalog,
+    ModelCatalogEntry,
+    ModelRuntime,
+    RequirementBasis,
+    ResourceKind,
+    ResourceRequirement,
+    RuntimeCompatibility,
+)
+from jarvis.ai.ollama import (
+    OLLAMA_MANAGER_MODEL_ID,
+    _NoRedirectHandler,
+    _UrllibOllamaTransport,
+    OllamaBackendError,
+    OllamaHTTPResponse,
+    OllamaLocalModelBackend,
+    OllamaModelUnavailableError,
+    OllamaOperationClassification,
+)
+from jarvis.ai.selection import AIProviderSelector
+from jarvis.ai.simulator import SimulatedAIProvider
+from jarvis.app import create_application
+from jarvis.config.settings import Settings
+
+
+_temporary_ledger_directories: list[tempfile.TemporaryDirectory[str]] = []
+_temporary_ledgers: list[RemoteOperationLedger] = []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_temporary_ledgers():
+    yield
+    for ledger in _temporary_ledgers:
+        ledger.close()
+    for directory in _temporary_ledger_directories:
+        directory.cleanup()
+
+
+def _temporary_ledger(max_concurrent_operations: int) -> RemoteOperationLedger:
+    directory = tempfile.TemporaryDirectory(prefix="jarvis-ledger-tests-")
+    _temporary_ledger_directories.append(directory)
+    ledger = RemoteOperationLedger(
+        max_concurrent_operations=max_concurrent_operations,
+        sqlite_path=Path(directory.name) / "remote-operations.sqlite3",
+    )
+    _temporary_ledgers.append(ledger)
+    return ledger
+
+
+class FakeOllamaTransport:
+    def __init__(
+        self,
+        responses: list[OllamaHTTPResponse | BaseException],
+        *,
+        runtime_version: str = "0.5.4",
+    ) -> None:
+        self.responses = list(responses)
+        self.runtime_version = runtime_version
+        self.calls: list[tuple[str, str, dict[str, object] | None, float]] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, object] | None,
+        timeout_seconds: float,
+    ) -> OllamaHTTPResponse:
+        self.calls.append((method, url, payload, timeout_seconds))
+        if url.endswith("/api/version"):
+            return _response({"version": self.runtime_version})
+        if not self.responses:
+            raise AssertionError("Unexpected Ollama HTTP request.")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+class FakeResourceProvider:
+    def snapshot(self) -> ResourceSnapshot:
+        return ResourceSnapshot(
+            source=ResourceSource.INFERENCE_BACKEND,
+            available_ram_bytes=1_000_000,
+            available_vram_bytes=1_000_000,
+            total_ram_bytes=2_000_000,
+        )
+
+
+class FakeContextTokenCounter:
+    tokenizer_id = "fixture-tokenizer"
+
+    def count_tokens(
+        self,
+        model_id: str,
+        task: LocalModelTask,
+        content: str,
+    ) -> int:
+        del model_id, task
+        return len(content.split())
+
+
+class _SyntheticTestOllamaBackend(OllamaLocalModelBackend):
+    def _require_authenticated_artifact_identity(self) -> None:
+        return None
+
+
+class MatchingIdentityVerifier:
+    def __init__(self, observed: ArtifactIdentity) -> None:
+        self.observed = observed
+
+    def verify(self, declared_identity: ArtifactIdentity) -> ArtifactIdentity:
+        del declared_identity
+        return self.observed
+
+
+class AllowOllamaUse:
+    def authorize(self, model, task) -> bool:
+        del model, task
+        return True
+
+
+class DenyOllamaUse:
+    def authorize(self, model, task) -> bool:
+        del model, task
+        return False
+
+
+class ChangingIdentityVerifier:
+    def __init__(
+        self,
+        first: ArtifactIdentity,
+        later: ArtifactIdentity,
+    ) -> None:
+        self.first = first
+        self.later = later
+        self.calls = 0
+
+    def verify(self, declared_identity: ArtifactIdentity) -> ArtifactIdentity:
+        del declared_identity
+        self.calls += 1
+        return self.first if self.calls == 1 else self.later
+
+
+def _synthetic_model_catalog(settings: Settings) -> ModelCatalog:
+    model_name = settings.local_ollama_model
+    assert type(model_name) is str
+    identity = ArtifactIdentity(
+        runtime=ModelRuntime.OLLAMA,
+        artifact_id=model_name,
+        variant="synthetic-test-variant",
+        quantization="synthetic-test-quantization",
+        digest="sha256:" + "a" * 64,
+    )
+    entry = ModelCatalogEntry(
+        entry_id="synthetic-test-entry",
+        identity=identity,
+        compatibility=RuntimeCompatibility(
+            ModelRuntime.OLLAMA,
+            "0.5.0",
+            "0.5.9",
+        ),
+        requirements=(
+            ResourceRequirement(
+                ResourceKind.RAM,
+                100,
+                RequirementBasis.CONSERVATIVE_BOUND,
+                "synthetic unit-test fixture",
+                "fixed test value",
+                "not a real model requirement",
+            ),
+            ResourceRequirement(
+                ResourceKind.VRAM,
+                50,
+                RequirementBasis.CONSERVATIVE_BOUND,
+                "synthetic unit-test fixture",
+                "fixed test value",
+                "not a real model requirement",
+            ),
+        ),
+        required_resources=frozenset({ResourceKind.RAM, ResourceKind.VRAM}),
+        max_context_tokens=settings.local_max_context_tokens,
+        tokenizer_id="fixture-tokenizer",
+    )
+    return ModelCatalog(
+        (entry,),
+        identity_verifier=MatchingIdentityVerifier(identity),
+    )
+
+
+def _response(
+    data: object,
+    *,
+    status_code: int = 200,
+) -> OllamaHTTPResponse:
+    return OllamaHTTPResponse(
+        status_code=status_code,
+        body=json.dumps(data).encode("utf-8"),
+    )
+
+
+def _settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "ai_enabled": True,
+        "ai_provider": "local",
+        "local_max_context_tokens": 128,
+        "local_ram_budget_mb": 1,
+        "local_vram_budget_mb": 1,
+        "local_ollama_model": "gemma3:latest",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def _backend(
+    transport: FakeOllamaTransport,
+    settings: Settings | None = None,
+    ledger: RemoteOperationLedger | None = None,
+) -> OllamaLocalModelBackend:
+    selected_settings = settings or _settings()
+    return _SyntheticTestOllamaBackend(
+        settings=selected_settings,
+        transport=transport,
+        ledger=ledger
+        or _temporary_ledger(
+            max_concurrent_operations=selected_settings.local_max_concurrent_inferences
+        ),
+        **_strict_backend_kwargs(selected_settings),
+    )
+
+
+def _strict_backend_kwargs(settings: Settings) -> dict[str, object]:
+    return {
+        "model_catalog": _synthetic_model_catalog(settings),
+        "catalog_entry_id": "synthetic-test-entry",
+        "model_use_authorizer": AllowOllamaUse(),
+        "token_counter": FakeContextTokenCounter(),
+    }
+
+
+def test_operation_is_persisted_before_transport_invocation(tmp_path) -> None:
+    database = tmp_path / "remote-operations.sqlite3"
+    ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+
+    class ObservingTransport:
+        def request(
+            self,
+            method: str,
+            url: str,
+            payload: dict[str, object] | None,
+            timeout_seconds: float,
+        ) -> OllamaHTTPResponse:
+            del method, timeout_seconds
+            with sqlite3.connect(database) as connection:
+                row = connection.execute(
+                    "SELECT outcome, operation_type FROM remote_operations"
+                ).fetchone()
+            assert row == ("pending", "inspect")
+            if url.endswith("/api/version"):
+                return _response({"version": "0.5.4"})
+            assert url.endswith("/api/show")
+            assert payload is not None
+            assert "operation_id" not in payload
+            return _response({"model_info": {"general.architecture": "test"}})
+
+    backend = _backend(ObservingTransport(), ledger=ledger)
+    backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    records = ledger.records()
+    assert len(records) == 1
+    assert records[0].outcome is RemoteOperationOutcome.TERMINAL_VALID
+    assert ledger.active_operation_count == 0
+    ledger.close()
+
+
+def test_backend_storage_failure_prevents_transport_send(tmp_path) -> None:
+    database = tmp_path / "remote-operations.sqlite3"
+    ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TRIGGER reject_dispatch BEFORE UPDATE ON remote_operations "
+        "WHEN NEW.outcome = 'pending' BEGIN "
+        "SELECT RAISE(ABORT, 'PRIVATE_SQLITE_FAILURE'); END"
+    )
+    connection.commit()
+    connection.close()
+    transport = FakeOllamaTransport([])
+    backend = _backend(transport, ledger=ledger)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert "PRIVATE_SQLITE_FAILURE" not in str(error.value)
+    assert transport.calls == []
+    assert ledger.active_operation_count == 1
+    assert ledger.records()[0].outcome is RemoteOperationOutcome.RESERVED
+    ledger.close()
+
+
+def test_backend_does_not_return_result_when_terminal_commit_fails(tmp_path) -> None:
+    database = tmp_path / "remote-operations.sqlite3"
+    ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TRIGGER reject_terminal BEFORE UPDATE ON remote_operations "
+        "WHEN NEW.outcome = 'terminal_valid' BEGIN "
+        "SELECT RAISE(ABORT, 'PRIVATE_SQLITE_FAILURE'); END"
+    )
+    connection.commit()
+    connection.close()
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    backend = _backend(transport, ledger=ledger)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert "PRIVATE_SQLITE_FAILURE" not in str(error.value)
+    assert len(transport.calls) == 2
+    assert ledger.records()[0].outcome is RemoteOperationOutcome.UNCERTAIN
+    assert ledger.active_operation_count == 1
+    ledger.close()
+
+
+def test_backend_enforces_capacity_across_sqlite_connections(tmp_path) -> None:
+    database = tmp_path / "remote-operations.sqlite3"
+    first_ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+    second_ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+    request_started = Event()
+    release_request = Event()
+    first_errors: list[BaseException] = []
+
+    class BlockingTransport:
+        def request(
+            self,
+            method: str,
+            url: str,
+            payload: dict[str, object] | None,
+            timeout_seconds: float,
+        ) -> OllamaHTTPResponse:
+            del method, payload, timeout_seconds
+            if url.endswith("/api/version"):
+                return _response({"version": "0.5.4"})
+            request_started.set()
+            if not release_request.wait(timeout=3):
+                raise TimeoutError("test transport release expired")
+            return _response({"model_info": {"general.architecture": "test"}})
+
+    first_transport = BlockingTransport()
+    second_transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    first_backend = _backend(first_transport, ledger=first_ledger)
+    second_backend = _backend(second_transport, ledger=second_ledger)
+
+    def first_load() -> None:
+        try:
+            first_backend.load(OLLAMA_MANAGER_MODEL_ID)
+        except BaseException as error:
+            first_errors.append(error)
+
+    worker = Thread(target=first_load)
+    worker.start()
+    try:
+        assert request_started.wait(timeout=3)
+        with pytest.raises(OllamaBackendError, match="capacity"):
+            second_backend.load(OLLAMA_MANAGER_MODEL_ID)
+        assert second_transport.calls == []
+    finally:
+        release_request.set()
+        worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert first_errors == []
+    first_ledger.close()
+    second_ledger.close()
+
+
+def test_pre_dispatch_failure_releases_only_its_ledger_record(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import jarvis.ai.ollama as ollama_module
+
+    database = tmp_path / "remote-operations.sqlite3"
+    ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+
+    def fail_request_construction(*args, **kwargs):
+        del args, kwargs
+        raise ValueError("PRIVATE_PREPARATION_MARKER")
+
+    monkeypatch.setattr(ollama_module, "Request", fail_request_construction)
+    backend = _backend(_UrllibOllamaTransport(), ledger=ledger)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    record = ledger.records()[0]
+    assert error.value.classification is OllamaOperationClassification.NOT_SENT
+    assert record.outcome is RemoteOperationOutcome.NOT_SENT
+    assert ledger.active_operation_count == 0
+    assert "PRIVATE_PREPARATION_MARKER" not in str(error.value)
+    ledger.close()
+
+
+def test_default_backend_uses_only_local_app_data_for_persistent_ledger(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    local_app_data = tmp_path / "user-local-app-data"
+    local_app_data.mkdir()
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    settings = _settings()
+    backend = _SyntheticTestOllamaBackend(
+        settings=settings,
+        transport=transport,
+        **_strict_backend_kwargs(settings),
+    )
+
+    backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    database = (
+        local_app_data
+        / "JARVIS"
+        / "remote-operations.sqlite3"
+    )
+    assert database.is_file()
+    assert backend._ledger.total_record_count == 1
+    backend._ledger.close()
+
+
+def test_persistent_ledger_does_not_store_prompts_responses_or_credentials(
+    tmp_path,
+) -> None:
+    database = tmp_path / "remote-operations.sqlite3"
+    ledger = RemoteOperationLedger(
+        max_concurrent_operations=1,
+        sqlite_path=database,
+    )
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response(
+                {
+                    "done": True,
+                    "response": "PRIVATE_RESPONSE_MARKER",
+                    "credential": "PRIVATE_CREDENTIAL_MARKER",
+                }
+            ),
+        ]
+    )
+    backend = _backend(transport, ledger=ledger)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert (
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+        == "PRIVATE_RESPONSE_MARKER"
+    )
+    ledger.close()
+
+    stored_bytes = database.read_bytes()
+    for marker in (
+        b"PRIVATE_PROMPT_MARKER",
+        b"PRIVATE_RESPONSE_MARKER",
+        b"PRIVATE_CREDENTIAL_MARKER",
+    ):
+        assert marker not in stored_bytes
+
+
+def test_uncertain_operation_survives_restart_and_blocks_new_inference(
+    tmp_path,
+) -> None:
+    database = tmp_path / "remote-operations.sqlite3"
+    settings = _settings(local_max_concurrent_inferences=2)
+    first_ledger = RemoteOperationLedger(
+        max_concurrent_operations=2,
+        sqlite_path=database,
+    )
+    first_transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            TimeoutError("PRIVATE_TIMEOUT_MARKER"),
+        ]
+    )
+    first_backend = _backend(first_transport, settings, first_ledger)
+    handle = first_backend.load(OLLAMA_MANAGER_MODEL_ID)
+    with pytest.raises(OllamaBackendError):
+        first_backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+    uncertain_records = tuple(
+        record
+        for record in first_ledger.records()
+        if record.outcome is RemoteOperationOutcome.UNCERTAIN
+    )
+    assert len(uncertain_records) == 1
+    first_ledger.close()
+
+    restarted_ledger = RemoteOperationLedger(
+        max_concurrent_operations=2,
+        sqlite_path=database,
+    )
+    second_transport = FakeOllamaTransport([])
+    restarted_backend = _backend(second_transport, settings, restarted_ledger)
+
+    with pytest.raises(OllamaBackendError) as error:
+        restarted_backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert error.value.classification is (
+        OllamaOperationClassification.OUTCOME_UNKNOWN
+    )
+    assert second_transport.calls == []
+    assert restarted_ledger.get(uncertain_records[0].operation_id).outcome is (
+        RemoteOperationOutcome.UNCERTAIN
+    )
+    assert restarted_ledger.active_operation_count == 1
+    restarted_ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("generation", "expected_outcome", "expected_active"),
+    (
+        (
+            {"done": True, "response": "private output"},
+            RemoteOperationOutcome.TERMINAL_VALID,
+            0,
+        ),
+        (
+            {"done": True, "response": ""},
+            RemoteOperationOutcome.TERMINAL_INVALID,
+            0,
+        ),
+        (
+            {"done": False, "response": "PRIVATE_PARTIAL_RESPONSE"},
+            RemoteOperationOutcome.UNCERTAIN,
+            1,
+        ),
+    ),
+)
+def test_inference_result_transitions_only_its_correlated_ledger_record(
+    generation: dict[str, object],
+    expected_outcome: RemoteOperationOutcome,
+    expected_active: int,
+) -> None:
+    ledger = _temporary_ledger(max_concurrent_operations=2)
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response(generation),
+        ]
+    )
+    backend = _backend(
+        transport,
+        settings=_settings(local_max_concurrent_inferences=2),
+        ledger=ledger,
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    if expected_outcome is RemoteOperationOutcome.TERMINAL_VALID:
+        assert (
+            backend.infer(
+                handle,
+                LocalModelTask.ANSWER_QUESTION,
+                "PRIVATE_PROMPT_MARKER",
+                context_tokens=8,
+                max_context_tokens=128,
+            )
+            == "private output"
+        )
+    else:
+        with pytest.raises(OllamaBackendError):
+            backend.infer(
+                handle,
+                LocalModelTask.ANSWER_QUESTION,
+                "PRIVATE_PROMPT_MARKER",
+                context_tokens=8,
+                max_context_tokens=128,
+            )
+
+    records = ledger.records()
+    infer_records = [
+        record
+        for record in records
+        if record.operation_type.value == "infer"
+    ]
+    assert len(infer_records) == 1
+    assert infer_records[0].outcome is expected_outcome
+    assert ledger.active_operation_count == expected_active
+    assert "PRIVATE_PROMPT_MARKER" not in repr(infer_records[0])
+    assert "PRIVATE_PARTIAL_RESPONSE" not in repr(infer_records[0])
+
+
+@pytest.mark.parametrize(
+    ("generation_response", "expected_outcome", "expected_active"),
+    (
+        (
+            _response({"error": "PRIVATE_HTTP_ERROR"}, status_code=500),
+            RemoteOperationOutcome.UNCERTAIN,
+            1,
+        ),
+        (
+            OllamaHTTPResponse(200, b"{PRIVATE_MALFORMED_JSON"),
+            RemoteOperationOutcome.UNCERTAIN,
+            1,
+        ),
+        (
+            _response({"done": False, "response": "PRIVATE_PARTIAL"}),
+            RemoteOperationOutcome.UNCERTAIN,
+            1,
+        ),
+        (
+            _response({"done": True, "response": ""}),
+            RemoteOperationOutcome.TERMINAL_INVALID,
+            0,
+        ),
+    ),
+)
+def test_ambiguous_and_terminal_invalid_responses_map_to_safe_ledger_states(
+    generation_response: OllamaHTTPResponse,
+    expected_outcome: RemoteOperationOutcome,
+    expected_active: int,
+) -> None:
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            generation_response,
+        ]
+    )
+    backend = _backend(transport, ledger=ledger)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    infer_record = next(
+        record
+        for record in ledger.records()
+        if record.operation_type.value == "infer"
+    )
+    assert infer_record.outcome is expected_outcome
+    assert ledger.active_operation_count == expected_active
+    assert "PRIVATE_PROMPT_MARKER" not in str(error.value)
+    assert "PRIVATE_HTTP_ERROR" not in str(error.value)
+    assert "PRIVATE_PARTIAL" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "failure_position",
+    ("status", "unload", "verify"),
+)
+def test_unload_keeps_one_slot_on_ambiguous_failure_in_any_http_phase(
+    failure_position: str,
+) -> None:
+    responses: list[OllamaHTTPResponse | BaseException] = [
+        _response({"model_info": {"general.architecture": "test"}})
+    ]
+    if failure_position == "status":
+        responses.append(TimeoutError("PRIVATE_STATUS_TIMEOUT"))
+    else:
+        responses.append(_response({"models": [{"name": "gemma3:latest"}]}))
+        if failure_position == "unload":
+            responses.append(TimeoutError("PRIVATE_UNLOAD_TIMEOUT"))
+        else:
+            responses.extend(
+                (
+                    _response({"done": True, "response": ""}),
+                    TimeoutError("PRIVATE_VERIFY_TIMEOUT"),
+                )
+            )
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    transport = FakeOllamaTransport(responses)
+    backend = _backend(transport, ledger=ledger)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.unload(handle)
+
+    unload_record = next(
+        record
+        for record in ledger.records()
+        if record.operation_type.value == "unload"
+    )
+    assert error.value.classification is OllamaOperationClassification.OUTCOME_UNKNOWN
+    assert unload_record.outcome is RemoteOperationOutcome.UNCERTAIN
+    assert ledger.active_operation_count == 1
+    assert len(transport.calls) == {
+        "status": 3,
+        "unload": 4,
+        "verify": 5,
+    }[failure_position]
+    assert all(
+        marker not in str(error.value)
+        for marker in (
+            "PRIVATE_STATUS_TIMEOUT",
+            "PRIVATE_UNLOAD_TIMEOUT",
+            "PRIVATE_VERIFY_TIMEOUT",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_generation",
+    (
+        {"done": True},
+        {"done": True, "response": ["invalid"]},
+    ),
+)
+def test_unload_terminal_invalid_response_stays_uncertain_and_stops_flow(
+    invalid_generation: dict[str, object],
+) -> None:
+    ledger = _temporary_ledger(max_concurrent_operations=2)
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response({"models": [{"name": "gemma3:latest"}]}),
+            _response(invalid_generation),
+        ]
+    )
+    backend = _backend(
+        transport,
+        settings=_settings(local_max_concurrent_inferences=2),
+        ledger=ledger,
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.unload(handle)
+
+    unload_record = next(
+        record
+        for record in ledger.records()
+        if record.operation_type.value == "unload"
+    )
+    assert error.value.classification is (
+        OllamaOperationClassification.TERMINAL_RESPONSE_INVALID
+    )
+    assert unload_record.outcome is RemoteOperationOutcome.UNCERTAIN
+    assert ledger.active_operation_count == 1
+    assert len(transport.calls) == 4
+
+    with pytest.raises(OllamaBackendError):
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+    assert len(transport.calls) == 4
+    assert ledger.get(unload_record.operation_id).outcome is (
+        RemoteOperationOutcome.UNCERTAIN
+    )
+
+
+def test_uncertain_record_blocks_later_inspection_without_clearing_it() -> None:
+    ledger = _temporary_ledger(max_concurrent_operations=2)
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            TimeoutError("PRIVATE_TIMEOUT"),
+            _response({"model_info": {"general.architecture": "test"}}),
+        ]
+    )
+    backend = _backend(
+        transport,
+        settings=_settings(local_max_concurrent_inferences=2),
+        ledger=ledger,
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+    with pytest.raises(OllamaBackendError):
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+    uncertain = next(
+        record
+        for record in ledger.records()
+        if record.outcome is RemoteOperationOutcome.UNCERTAIN
+    )
+
+    calls_before_inspection = len(transport.calls)
+    with pytest.raises(OllamaBackendError) as error:
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert error.value.classification is OllamaOperationClassification.OUTCOME_UNKNOWN
+    assert len(transport.calls) == calls_before_inspection
+    assert ledger.get(uncertain.operation_id) == uncertain
+    assert ledger.get(uncertain.operation_id).outcome is (
+        RemoteOperationOutcome.UNCERTAIN
+    )
+    assert ledger.active_operation_count == 1
+
+
+def test_ollama_backend_without_verifier_is_blocked_before_transport() -> None:
+    settings = _settings()
+    dependencies = _strict_backend_kwargs(settings)
+    entry = dependencies["model_catalog"].entries[0]
+    dependencies["model_catalog"] = ModelCatalog((entry,))
+    transport = FakeOllamaTransport([])
+    backend = _SyntheticTestOllamaBackend(
+        settings=settings,
+        transport=transport,
+        ledger=_temporary_ledger(max_concurrent_operations=1),
+        **dependencies,
+    )
+
+    with pytest.raises(OllamaBackendError, match="verification and authorization"):
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert transport.calls == []
+
+
+def test_ollama_backend_rejects_runtime_identity_mismatch() -> None:
+    settings = _settings()
+    dependencies = _strict_backend_kwargs(settings)
+    declared_catalog = dependencies["model_catalog"]
+    entry = declared_catalog.entries[0]
+    other_identity = ArtifactIdentity(
+        runtime=entry.identity.runtime,
+        artifact_id=entry.identity.artifact_id,
+        variant="different-synthetic-variant",
+        quantization=entry.identity.quantization,
+        digest=entry.identity.digest,
+    )
+    dependencies["model_catalog"] = ModelCatalog(
+        (entry,),
+        identity_verifier=MatchingIdentityVerifier(other_identity),
+    )
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    backend = OllamaLocalModelBackend(
+        settings=settings,
+        transport=transport,
+        ledger=ledger,
+        **dependencies,
+    )
+
+    with pytest.raises(OllamaBackendError, match="strictly verified"):
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert [call[1].rsplit("/", 1)[-1] for call in transport.calls] == ["version"]
+    assert ledger.records()[0].outcome is RemoteOperationOutcome.UNCERTAIN
+
+
+def test_ollama_backend_rejects_denied_authorization_and_incompatible_runtime() -> None:
+    settings = _settings()
+    denied_dependencies = _strict_backend_kwargs(settings)
+    denied_dependencies["model_use_authorizer"] = DenyOllamaUse()
+    denied_transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    denied_backend = _SyntheticTestOllamaBackend(
+        settings=settings,
+        transport=denied_transport,
+        ledger=_temporary_ledger(max_concurrent_operations=1),
+        **denied_dependencies,
+    )
+
+    with pytest.raises(OllamaBackendError, match="not authorized"):
+        denied_backend.load(OLLAMA_MANAGER_MODEL_ID)
+    assert [call[1].rsplit("/", 1)[-1] for call in denied_transport.calls] == [
+        "version"
+    ]
+
+    incompatible_transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})],
+        runtime_version="9.0.0",
+    )
+    incompatible_backend = _backend(incompatible_transport)
+    with pytest.raises(OllamaBackendError, match="strictly verified"):
+        incompatible_backend.load(OLLAMA_MANAGER_MODEL_ID)
+    assert [call[1].rsplit("/", 1)[-1] for call in incompatible_transport.calls] == [
+        "version"
+    ]
+
+
+def test_ollama_backend_reverifies_identity_before_inference() -> None:
+    settings = _settings()
+    dependencies = _strict_backend_kwargs(settings)
+    catalog = dependencies["model_catalog"]
+    entry = catalog.entries[0]
+    changed_identity = ArtifactIdentity(
+        runtime=entry.identity.runtime,
+        artifact_id=entry.identity.artifact_id,
+        variant=entry.identity.variant,
+        quantization=entry.identity.quantization,
+        digest="sha256:" + "b" * 64,
+    )
+    dependencies["model_catalog"] = ModelCatalog(
+        (entry,),
+        identity_verifier=ChangingIdentityVerifier(
+            entry.identity,
+            changed_identity,
+        ),
+    )
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    backend = _SyntheticTestOllamaBackend(
+        settings=settings,
+        transport=transport,
+        ledger=ledger,
+        **dependencies,
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError, match="did not complete reliably"):
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "Pregunta",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert [call[1].rsplit("/", 1)[-1] for call in transport.calls] == [
+        "version",
+        "show",
+        "version",
+    ]
+    assert ledger.records()[-1].outcome is RemoteOperationOutcome.UNCERTAIN
+
+
+def test_backend_blocks_generation_without_authenticated_artifact_identity() -> None:
+    settings = _settings()
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    backend = OllamaLocalModelBackend(
+        settings=settings,
+        transport=transport,
+        ledger=_temporary_ledger(max_concurrent_operations=1),
+        **_strict_backend_kwargs(settings),
+    )
+    assert backend._model_catalog is not None
+    assert backend._model_catalog.has_identity_verifier is True
+    assert backend._model_catalog.has_authenticated_identity_verifier is False
+
+    with pytest.raises(
+        OllamaBackendError,
+        match="Production artifact identity verification is unavailable",
+    ) as error:
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert error.value.classification is OllamaOperationClassification.NOT_SENT
+    assert transport.calls == []
+
+
+def _manager(
+    backend: OllamaLocalModelBackend,
+    settings: Settings,
+) -> LocalModelManager:
+    manager = LocalModelManager(
+        backend=backend,
+        resource_provider=FakeResourceProvider(),
+        token_counter=FakeContextTokenCounter(),
+        limits=LocalModelLimits.from_settings(settings),
+    )
+    manager.register(
+        LocalModelDescriptor(
+            model_id=OLLAMA_MANAGER_MODEL_ID,
+            tasks=frozenset(
+                {LocalModelTask.ANSWER_QUESTION, LocalModelTask.SUMMARIZE_TEXT}
+            ),
+            max_context_tokens=settings.local_max_context_tokens,
+            requirements=ModelRequirements(ram_bytes=100, vram_bytes=50),
+            catalog_entry_id="synthetic-test-entry",
+            tokenizer_model_id=settings.local_ollama_model,
+            tokenizer_id="fixture-tokenizer",
+        )
+    )
+    return manager
+
+
+def test_synthetic_catalog_verifier_cannot_enable_production_composition() -> None:
+    settings = _settings()
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    backend = _backend(transport, settings)
+    manager = _manager(backend, settings)
+
+    assert backend._model_catalog is not None
+    assert backend._model_catalog.has_identity_verifier is True
+    assert manager.is_production_ready is False
+    with pytest.raises(ValueError, match="not verified for production"):
+        create_application(settings, local_model_manager=manager)
+    with pytest.raises(LocalModelResourceError):
+        manager.run(
+            task=LocalModelTask.ANSWER_QUESTION,
+            content="synthetic test input",
+        )
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://127.0.0.1:11434",
+        "http://example.test:11434",
+        "http://127.0.0.1:11434/path",
+        "http://user:password@127.0.0.1:11434",
+        "http://127.0.0.1:11434?target=external",
+    ),
+)
+def test_settings_reject_non_local_or_ambiguous_ollama_urls(url: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(local_ollama_base_url=url)
+
+
+def test_settings_validate_ollama_model_and_timeout() -> None:
+    settings = Settings.from_env(
+        {
+            "JARVIS_LOCAL_OLLAMA_BASE_URL": "http://localhost:11434/",
+            "JARVIS_LOCAL_OLLAMA_MODEL": "gemma3:latest",
+            "JARVIS_LOCAL_OLLAMA_TIMEOUT_SECONDS": "12.5",
+        }
+    )
+    assert settings.local_ollama_base_url == "http://localhost:11434"
+    assert settings.local_ollama_model == "gemma3:latest"
+    assert settings.local_ollama_timeout_seconds == 12.5
+
+    assert Settings(local_ollama_model="").local_ollama_model is None
+    for invalid_model in ("model name", "../model", "\x00model"):
+        with pytest.raises(ValidationError):
+            Settings(local_ollama_model=invalid_model)
+    for invalid_timeout in (0, -1, float("inf"), True):
+        with pytest.raises(ValidationError):
+            Settings(local_ollama_timeout_seconds=invalid_timeout)
+
+
+def test_ollama_backend_requires_explicit_local_configuration() -> None:
+    for settings in (
+        Settings(),
+        Settings(ai_enabled=True, ai_provider="simulated"),
+        Settings(
+            ai_enabled=True,
+            ai_provider="local",
+            local_max_context_tokens=128,
+        ),
+    ):
+        with pytest.raises(ValueError):
+            OllamaLocalModelBackend(settings=settings)
+
+
+def test_standard_transport_disables_proxies_and_rejects_redirects(
+    monkeypatch,
+) -> None:
+    import jarvis.ai.ollama as ollama_module
+
+    class RedirectingOpener:
+        def open(self, request, timeout):
+            assert request.full_url == "http://127.0.0.1:11434/api/show"
+            assert timeout == 2.0
+            raise HTTPError(
+                request.full_url,
+                302,
+                "redirect",
+                {},
+                BytesIO(b""),
+            )
+
+    def build_opener(*handlers):
+        proxy_handler = next(
+            handler for handler in handlers if isinstance(handler, ProxyHandler)
+        )
+        redirect_handler = next(
+            handler for handler in handlers if isinstance(handler, _NoRedirectHandler)
+        )
+        assert proxy_handler.proxies == {}
+        assert (
+            redirect_handler.redirect_request(
+                Request("http://127.0.0.1:11434/api/show"),
+                BytesIO(),
+                302,
+                "redirect",
+                {},
+                "http://external.invalid/",
+            )
+            is None
+        )
+        return RedirectingOpener()
+
+    monkeypatch.setattr(ollama_module, "build_opener", build_opener)
+    response = _UrllibOllamaTransport().request(
+        "POST",
+        "http://127.0.0.1:11434/api/show",
+        {"model": "gemma3:latest"},
+        2.0,
+    )
+
+    assert response.status_code == 302
+    assert response.body == b""
+
+
+def test_transport_preparation_failure_is_classified_as_not_sent(monkeypatch) -> None:
+    import jarvis.ai.ollama as ollama_module
+
+    def fail_request(*args, **kwargs):
+        del args, kwargs
+        raise ValueError("PRIVATE_PREPARATION_FAILURE")
+
+    def unexpected_build_opener(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Transport opener must not be constructed.")
+
+    monkeypatch.setattr(ollama_module, "Request", fail_request)
+    monkeypatch.setattr(ollama_module, "build_opener", unexpected_build_opener)
+
+    with pytest.raises(OllamaBackendError) as error:
+        _UrllibOllamaTransport().request(
+            "POST",
+            "http://127.0.0.1:11434/api/generate",
+            {"prompt": "PRIVATE_PROMPT_MARKER"},
+            2.0,
+        )
+
+    assert error.value.classification is OllamaOperationClassification.NOT_SENT
+    assert "PRIVATE_" not in str(error.value)
+
+
+def test_invalid_inference_input_is_classified_not_sent_without_transport_call() -> None:
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    backend = _backend(transport, ledger=ledger)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=129,
+            max_context_tokens=128,
+        )
+
+    assert error.value.classification is OllamaOperationClassification.NOT_SENT
+    assert "PRIVATE_PROMPT_MARKER" not in str(error.value)
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.parametrize("counted_tokens", [0, -1])
+def test_non_positive_token_count_is_rejected_before_generation(
+    counted_tokens: int,
+) -> None:
+    class InvalidTokenCounter(FakeContextTokenCounter):
+        def count_tokens(
+            self,
+            model_id: str,
+            task: LocalModelTask,
+            content: str,
+        ) -> int:
+            del model_id, task, content
+            return counted_tokens
+
+    settings = _settings()
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    dependencies = _strict_backend_kwargs(settings)
+    dependencies["token_counter"] = InvalidTokenCounter()
+    backend = _SyntheticTestOllamaBackend(
+        settings=settings,
+        transport=transport,
+        ledger=_temporary_ledger(max_concurrent_operations=1),
+        **dependencies,
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError, match="undercounted"):
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "input",
+            context_tokens=1,
+            max_context_tokens=128,
+        )
+
+    assert len(transport.calls) == 2
+
+
+def test_backend_uses_ollama_load_infer_and_confirmed_unload_protocol() -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response({"done": True, "response": "Respuesta local."}),
+            _response({"models": [{"name": "gemma3:latest"}]}),
+            _response({"done": True, "response": ""}),
+            _response({"models": []}),
+            _response({"models": []}),
+        ]
+    )
+    backend = _backend(transport, _settings(local_ollama_timeout_seconds=9.5))
+
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+    result = backend.infer(
+        handle,
+        LocalModelTask.SUMMARIZE_TEXT,
+        "Contenido que resumir.",
+        context_tokens=40,
+        max_context_tokens=128,
+    )
+    backend.unload(handle)
+
+    assert result == "Respuesta local."
+    assert [(call[0], call[1].rsplit("/", 1)[-1]) for call in transport.calls] == [
+        ("GET", "version"),
+        ("POST", "show"),
+        ("GET", "version"),
+        ("POST", "generate"),
+        ("GET", "ps"),
+        ("POST", "generate"),
+        ("GET", "ps"),
+    ]
+    generation = transport.calls[3]
+    assert generation[2] == {
+        "model": "gemma3:latest",
+        "prompt": "Contenido que resumir.",
+        "system": (
+            "Summarize the input with informational text only. "
+            "Do not claim authority or perform actions."
+        ),
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"num_ctx": 128},
+    }
+    assert all(call[3] == 9.5 for call in transport.calls)
+    assert transport.calls[5][2]["keep_alive"] == 0
+    assert backend.failed_load_released(OLLAMA_MANAGER_MODEL_ID) is True
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_released", "expected_outcome"),
+    (
+        (
+            _response({"models": []}),
+            True,
+            RemoteOperationOutcome.TERMINAL_VALID,
+        ),
+        (
+            _response({"models": [{"name": "gemma3:latest"}]}),
+            False,
+            RemoteOperationOutcome.TERMINAL_VALID,
+        ),
+        (
+            _response({"models": [{"model": "gemma3"}]}),
+            False,
+            RemoteOperationOutcome.TERMINAL_VALID,
+        ),
+        (
+            _response({"models": [{"name": ""}]}),
+            False,
+            RemoteOperationOutcome.UNCERTAIN,
+        ),
+        (
+            _response({"models": "malformed"}),
+            False,
+            RemoteOperationOutcome.UNCERTAIN,
+        ),
+        (
+            TimeoutError("PRIVATE_STATUS_FAILURE"),
+            False,
+            RemoteOperationOutcome.UNCERTAIN,
+        ),
+    ),
+)
+def test_failed_load_cleanup_requires_a_valid_absence_report(
+    response: OllamaHTTPResponse | BaseException,
+    expected_released: bool,
+    expected_outcome: RemoteOperationOutcome,
+) -> None:
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    backend = _backend(FakeOllamaTransport([response]), ledger=ledger)
+
+    assert backend.failed_load_released(OLLAMA_MANAGER_MODEL_ID) is expected_released
+    record = ledger.records()[0]
+    assert record.outcome is expected_outcome
+
+
+def test_failed_load_cleanup_rejects_wrong_manager_id_without_request() -> None:
+    transport = FakeOllamaTransport([])
+    backend = _backend(transport)
+
+    assert backend.failed_load_released("different-model") is False
+    assert transport.calls == []
+
+
+def test_cleanup_name_matching_is_tag_exact_and_latest_aware() -> None:
+    backend = _backend(FakeOllamaTransport([]))
+
+    assert backend._configured_model_is_running({"gemma3"})
+    assert backend._configured_model_is_running({"gemma3:latest"})
+    assert not backend._configured_model_is_running({"gemma3:other"})
+    assert not backend._configured_model_is_running({"gemma30:latest"})
+
+
+def test_list_installed_models_preserves_server_order_without_model_operations() -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response(
+                {
+                    "models": [
+                        {"name": "qwen3:4b"},
+                        {"name": "gemma3:latest"},
+                    ]
+                }
+            )
+        ]
+    )
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    backend = _backend(transport, ledger=ledger)
+
+    assert backend.list_installed_models() == ("qwen3:4b", "gemma3:latest")
+    assert [(method, url.rsplit("/", 1)[-1]) for method, url, _, _ in transport.calls] == [
+        ("GET", "tags")
+    ]
+    assert ledger.records() == ()
+
+
+def test_list_installed_models_accepts_an_empty_catalog() -> None:
+    backend = _backend(FakeOllamaTransport([_response({"models": []})]))
+
+    assert backend.list_installed_models() == ()
+
+
+@pytest.mark.parametrize(
+    "data",
+    (
+        {},
+        {"models": None},
+        {"models": "qwen3:4b"},
+        {"models": [{"name": "qwen3:4b"}, None]},
+        {"models": [{}]},
+        {"models": [{"name": ""}]},
+        {"models": [{"name": None}]},
+        {"models": [{"name": "model name"}]},
+        {"models": [{"name": "qwen3:4b"}, {"name": "qwen3:4b"}]},
+    ),
+)
+def test_list_installed_models_rejects_malformed_catalogs(data: object) -> None:
+    backend = _backend(
+        FakeOllamaTransport([_response(data)])
+    )
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.list_installed_models()
+
+    assert error.value.classification is OllamaOperationClassification.RESPONSE_INVALID
+    assert "invalid" in str(error.value)
+
+
+def test_list_installed_models_treats_http_404_as_catalog_http_failure() -> None:
+    backend = _backend(
+        FakeOllamaTransport(
+            [_response({"error": "PRIVATE_HTTP_BODY"}, status_code=404)]
+        )
+    )
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.list_installed_models()
+
+    assert type(error.value) is OllamaBackendError
+    assert error.value.classification is (
+        OllamaOperationClassification.HTTP_RESPONSE_RECEIVED
+    )
+    assert "PRIVATE_HTTP_BODY" not in str(error.value)
+
+
+def test_list_installed_models_rejects_oversized_response() -> None:
+    import jarvis.ai.ollama as ollama_module
+
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                OllamaHTTPResponse(
+                    200,
+                    b"x" * (ollama_module._MAX_RESPONSE_BYTES + 1),
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.list_installed_models()
+
+    assert error.value.classification is OllamaOperationClassification.RESPONSE_INVALID
+    assert "PRIVATE" not in str(error.value)
+
+
+def test_list_installed_models_sanitizes_transport_failure() -> None:
+    backend = _backend(
+        FakeOllamaTransport([TimeoutError("PRIVATE_TIMEOUT_MARKER")])
+    )
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.list_installed_models()
+
+    assert error.value.classification is OllamaOperationClassification.OUTCOME_UNKNOWN
+    assert "PRIVATE_TIMEOUT_MARKER" not in str(error.value)
+
+
+def test_ollama_inference_returns_only_response_when_thinking_is_present() -> None:
+    thinking_marker = "PRIVATE_THINKING_MARKER_7f3a"
+    final_response = "Esta es la respuesta final en español."
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                _response({"model_info": {"general.architecture": "test"}}),
+                _response(
+                    {
+                        "done": True,
+                        "thinking": thinking_marker,
+                        "response": final_response,
+                    }
+                ),
+            ]
+        )
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    result = backend.infer(
+        handle,
+        LocalModelTask.ANSWER_QUESTION,
+        "Pregunta",
+        context_tokens=8,
+        max_context_tokens=128,
+    )
+
+    assert result == final_response
+    assert thinking_marker not in result
+
+
+def test_ollama_inference_errors_do_not_expose_thinking_text() -> None:
+    thinking_marker = "PRIVATE_THINKING_MARKER_a91c"
+    partial_response = "PRIVATE_PARTIAL_RESPONSE_MARKER_62de"
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                _response({"model_info": {"general.architecture": "test"}}),
+                _response(
+                    {
+                        "done": False,
+                        "thinking": thinking_marker,
+                        "response": partial_response,
+                    }
+                ),
+            ]
+        )
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "Pregunta",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert thinking_marker not in str(error.value)
+    assert partial_response not in str(error.value)
+
+
+def test_ollama_inference_accepts_response_without_thinking_field() -> None:
+    final_response = "Respuesta sin campo thinking."
+    backend = _backend(
+        FakeOllamaTransport(
+            [
+                _response({"model_info": {"general.architecture": "test"}}),
+                _response({"done": True, "response": final_response}),
+            ]
+        )
+    )
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    result = backend.infer(
+        handle,
+        LocalModelTask.ANSWER_QUESTION,
+        "Pregunta",
+        context_tokens=8,
+        max_context_tokens=128,
+    )
+
+    assert result == final_response
+
+
+@pytest.mark.parametrize(
+    ("response", "error_type"),
+    (
+        (TimeoutError("PRIVATE_TIMEOUT_MARKER"), OllamaBackendError),
+        (OSError("PRIVATE_CONNECTION_MARKER"), OllamaBackendError),
+        (_response({"error": "PRIVATE_MODEL_MARKER"}, status_code=404), OllamaModelUnavailableError),
+        (_response({"model_info": []}), OllamaBackendError),
+        (OllamaHTTPResponse(200, b"not json"), OllamaBackendError),
+        (_response({"done": False, "response": "partial"}), OllamaBackendError),
+        (_response({"done": True}), OllamaBackendError),
+        (_response({"done": True, "response": ""}), OllamaBackendError),
+    ),
+)
+def test_ollama_load_errors_are_controlled_and_do_not_expose_details(
+    response: OllamaHTTPResponse | BaseException,
+    error_type: type[Exception],
+) -> None:
+    backend = _backend(FakeOllamaTransport([response]))
+
+    with pytest.raises(error_type) as error:
+        backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    assert "PRIVATE_" not in str(error.value)
+    assert "gemma3" not in repr(error.value)
+
+
+def test_inference_transport_failure_marks_remote_state_uncertain() -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            TimeoutError("PRIVATE_TIMEOUT_MARKER"),
+        ]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "Pregunta",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+    with pytest.raises(OllamaBackendError, match="uncertain"):
+        backend.unload(handle)
+
+    assert "PRIVATE_TIMEOUT_MARKER" not in str(error.value)
+    assert len(transport.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        TimeoutError("PRIVATE_TIMEOUT_MARKER"),
+        ConnectionResetError("PRIVATE_DISCONNECT_MARKER"),
+    ),
+)
+def test_post_invocation_transport_failures_are_uncertain_and_sanitized(
+    failure: BaseException,
+) -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            failure,
+        ]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert error.value.classification is OllamaOperationClassification.OUTCOME_UNKNOWN
+    assert all(
+        marker not in str(error.value)
+        for marker in (
+            "PRIVATE_TIMEOUT_MARKER",
+            "PRIVATE_DISCONNECT_MARKER",
+            "PRIVATE_PROMPT_MARKER",
+        )
+    )
+    with pytest.raises(OllamaBackendError, match="uncertain"):
+        backend.unload(handle)
+    assert len(transport.calls) == 4
+
+
+def test_response_body_read_failure_is_uncertain_and_sanitized(monkeypatch) -> None:
+    import jarvis.ai.ollama as ollama_module
+
+    class FailingBodyResponse:
+        status = 200
+        closed = False
+
+        def read(self, limit: int) -> bytes:
+            assert limit > 0
+            raise OSError(
+                "PRIVATE_BODY_READ_FAILURE PRIVATE_PARTIAL_RESPONSE "
+                "PRIVATE_CREDENTIAL_MARKER"
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    response = FailingBodyResponse()
+    opener_calls = 0
+
+    class Opener:
+        def open(self, request, timeout):
+            nonlocal opener_calls
+            opener_calls += 1
+            assert request.full_url.endswith("/api/generate")
+            return response
+
+    monkeypatch.setattr(ollama_module, "build_opener", lambda *args: Opener())
+
+    class ResponseReadFailureTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.transport = _UrllibOllamaTransport()
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            payload: dict[str, object] | None,
+            timeout_seconds: float,
+        ) -> OllamaHTTPResponse:
+            self.calls += 1
+            if url.endswith("/api/version"):
+                return _response({"version": "0.5.4"})
+            if url.endswith("/api/show"):
+                return _response(
+                    {"model_info": {"general.architecture": "test"}}
+                )
+            return self.transport.request(
+                method,
+                url,
+                payload,
+                timeout_seconds,
+            )
+
+    transport = ResponseReadFailureTransport()
+    ledger = _temporary_ledger(max_concurrent_operations=1)
+    backend = _backend(transport, ledger=ledger)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert error.value.classification is OllamaOperationClassification.OUTCOME_UNKNOWN
+    assert all(
+        marker not in str(error.value)
+        for marker in (
+            "PRIVATE_BODY_READ_FAILURE",
+            "PRIVATE_PARTIAL_RESPONSE",
+            "PRIVATE_CREDENTIAL_MARKER",
+            "PRIVATE_PROMPT_MARKER",
+        )
+    )
+    assert response.closed
+    assert opener_calls == 1
+    assert transport.calls == 4
+    with pytest.raises(OllamaBackendError, match="uncertain"):
+        backend.unload(handle)
+    assert transport.calls == 4
+    assert any(
+        record.operation_type.value == "infer"
+        and record.outcome is RemoteOperationOutcome.UNCERTAIN
+        for record in ledger.records()
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "classification"),
+    (
+        (
+            _response(
+                {
+                    "error": "PRIVATE_SERVER_ERROR",
+                    "response": "PRIVATE_PARTIAL",
+                    "authorization": "PRIVATE_CREDENTIAL_MARKER",
+                },
+                status_code=500,
+            ),
+            OllamaOperationClassification.HTTP_RESPONSE_RECEIVED,
+        ),
+        (
+            OllamaHTTPResponse(
+                200,
+                b'{"done": true, "response": "PRIVATE_SERVER_CONTENT"',
+            ),
+            OllamaOperationClassification.RESPONSE_INVALID,
+        ),
+    ),
+)
+def test_http_error_and_invalid_json_are_classified_without_leaking_content(
+    response: OllamaHTTPResponse,
+    classification: OllamaOperationClassification,
+) -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            response,
+        ]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    assert error.value.classification is classification
+    assert all(
+        marker not in str(error.value)
+        for marker in (
+            "PRIVATE_SERVER_ERROR",
+            "PRIVATE_SERVER_CONTENT",
+            "PRIVATE_PARTIAL",
+            "PRIVATE_CREDENTIAL_MARKER",
+            "PRIVATE_PROMPT",
+        )
+    )
+    with pytest.raises(OllamaBackendError, match="uncertain"):
+        backend.unload(handle)
+    assert len(transport.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "generation",
+    (
+        {"done": False, "response": "PRIVATE_PARTIAL_RESPONSE"},
+        {"done": True},
+        {"done": True, "response": ""},
+        {"done": True, "response": "PRIVATE_INVALID_RESPONSE_MARKER\x00"},
+    ),
+)
+def test_incomplete_or_invalid_generation_is_classified_and_sanitized(
+    generation: dict[str, object],
+) -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response(generation),
+            _response({"models": []}),
+        ]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "PRIVATE_PROMPT_MARKER",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+
+    expected_classification = (
+        OllamaOperationClassification.OUTCOME_UNKNOWN
+        if generation["done"] is not True
+        else OllamaOperationClassification.TERMINAL_RESPONSE_INVALID
+    )
+    assert error.value.classification is expected_classification
+    assert "PRIVATE_PROMPT_MARKER" not in str(error.value)
+    assert "PRIVATE_PARTIAL_RESPONSE" not in str(error.value)
+    assert "PRIVATE_INVALID_RESPONSE_MARKER" not in str(error.value)
+
+    if generation["done"] is True:
+        backend.unload(handle)
+        assert len(transport.calls) == 5
+    else:
+        with pytest.raises(OllamaBackendError, match="uncertain"):
+            backend.unload(handle)
+        assert len(transport.calls) == 4
+
+
+def test_unload_http_error_is_received_but_not_treated_as_confirmed_unload() -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response({"models": [{"name": "gemma3:latest"}]}),
+            _response(
+                {
+                    "error": "PRIVATE_UNLOAD_SERVER_ERROR",
+                    "authorization": "PRIVATE_CREDENTIAL_MARKER",
+                },
+                status_code=500,
+            ),
+        ]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError) as error:
+        backend.unload(handle)
+
+    assert error.value.classification is (
+        OllamaOperationClassification.HTTP_RESPONSE_RECEIVED
+    )
+    assert "PRIVATE_UNLOAD_SERVER_ERROR" not in str(error.value)
+    assert "PRIVATE_CREDENTIAL_MARKER" not in str(error.value)
+    assert len(transport.calls) == 4
+    with pytest.raises(OllamaBackendError, match="uncertain"):
+        backend.unload(handle)
+
+
+def test_valid_terminal_generation_is_classified_as_terminal_and_valid() -> None:
+    classification, text = OllamaLocalModelBackend._generation_text(
+        {"done": True, "response": "Respuesta final."},
+        allow_empty=False,
+    )
+
+    assert classification is (
+        OllamaOperationClassification.TERMINAL_RESPONSE_VALIDATED
+    )
+    assert text == "Respuesta final."
+
+
+def test_ollama_backend_rejects_invalid_context_before_http_request() -> None:
+    transport = FakeOllamaTransport(
+        [_response({"model_info": {"general.architecture": "test"}})]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError, match="context"):
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "Pregunta",
+            context_tokens=129,
+            max_context_tokens=128,
+        )
+
+    assert len(transport.calls) == 2
+
+
+def test_completed_but_invalid_generation_can_still_be_unloaded() -> None:
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}}),
+            _response({"done": True, "response": ""}),
+            _response({"models": [{"name": "gemma3:latest"}]}),
+            _response({"done": True, "response": ""}),
+            _response({"models": []}),
+        ]
+    )
+    backend = _backend(transport)
+    handle = backend.load(OLLAMA_MANAGER_MODEL_ID)
+
+    with pytest.raises(OllamaBackendError):
+        backend.infer(
+            handle,
+            LocalModelTask.ANSWER_QUESTION,
+            "Pregunta",
+            context_tokens=8,
+            max_context_tokens=128,
+        )
+    backend.unload(handle)
+
+    assert len(transport.calls) == 7
+
+
+def test_backend_revalidates_mutated_settings_before_use() -> None:
+    settings = _settings()
+    settings.local_ollama_base_url = "http://example.test"
+
+    with pytest.raises(ValidationError):
+        OllamaLocalModelBackend(settings=settings)
+
+
+def test_application_rejects_incomplete_ollama_manager_before_any_request() -> None:
+    settings = _settings()
+    transport = FakeOllamaTransport(
+        [
+            _response({"model_info": {"general.architecture": "test"}})
+        ]
+    )
+    manager = _manager(_backend(transport, settings), settings)
+    with pytest.raises(ValueError, match="not verified for production"):
+        create_application(settings, local_model_manager=manager)
+    assert transport.calls == []
+
+
+def test_local_mode_without_production_manager_has_no_remote_fallback() -> None:
+    settings = _settings()
+    app = create_application(settings)
+    calls = {"remote": 0}
+
+    class RemoteSpy(SimulatedAIProvider):
+        def respond_informational(self, request: InformationalRequest):
+            del request
+            calls["remote"] += 1
+            raise AssertionError("Local provider absence invoked remote AI.")
+
+    app.provider_selector = AIProviderSelector({"remote": RemoteSpy()})
+    result = app.process("pregunta: ¿qué significa?")
+
+    assert result.success is False
+    assert result.authorized is False
+    assert result.error == "Informative processing is unavailable."
+    assert calls == {"remote": 0}

@@ -1,0 +1,56 @@
+﻿diff --git a/src/jarvis/tools/runner.py b/src/jarvis/tools/runner.py
+index a0ac03e..8452138 100644
+--- a/src/jarvis/tools/runner.py
++++ b/src/jarvis/tools/runner.py
+@@ -109,20 +109,25 @@ class _SimulatedToolDispatcher:
+ 
+     @property
+     def authorization_service(self) -> AuthorizationService:
+         return self._authorization_service
+ 
+     @property
+     def audit_logger(self) -> AuditLogger:
+         return self._audit_logger
+ 
+     def execute(self, proposal: ToolProposal, context: ConversationContext) -> dict[str, Any]:
++        if (
++            isinstance(self, SimulatedToolRunner)
++            and self._executors is not _TRUSTED_EXECUTORS
++        ):
++            raise AuthorizationError("Authorization could not be verified.")
+         if (
+             type(self.registry) is not ToolRegistry
+             or self.registry.is_frozen is not True
+             or type(self.authorization_service) is not AuthorizationService
+             or self.registry is not self.authorization_service.registry
+         ):
+             raise AuthorizationError("Authorization could not be verified.")
+         if type(self.mode) is not str or self.mode != "simulated":
+             raise SimulatedModeError("Only simulated mode is allowed in Fase 1.")
+         if type(proposal) is not ToolProposal or type(proposal.tool_name) is not str:
+@@ -171,20 +176,25 @@ class _SimulatedToolDispatcher:
+                 action_ref=execution_proposal.action_ref,
+                 outcome="allowed",
+                 details={
+                     "authorization": "granted",
+                     "execution_status": "authorized",
+                     "tool_name": execution_proposal.tool_name,
+                 },
+             )
+         except Exception:
+             raise PreExecutionAuditError() from None
++        if (
++            isinstance(self, SimulatedToolRunner)
++            and self._executors is not _TRUSTED_EXECUTORS
++        ):
++            raise AuthorizationError("Authorization could not be verified.")
+         try:
+             executor = self._executors[execution_proposal.tool_name]
+             result = executor(context, **execution_proposal.parameters)
+         except Exception:
+             raise ToolExecutionError("Simulated tool execution failed.") from None
+         return {
+             "tool_name": execution_proposal.tool_name,
+             "status": "simulated_ok",
+             "result": result,
+         }

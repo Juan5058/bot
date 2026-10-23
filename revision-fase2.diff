@@ -1,0 +1,342 @@
+diff --git a/docs/security.md b/docs/security.md
+index 5010efe..b346485 100644
+--- a/docs/security.md
++++ b/docs/security.md
+@@ -16,3 +16,9 @@
+ - No se almacenan claves, tokens ni secretos en el repositorio.
+ - La auditoría elimina valores sensibles en clave, token, password o secret.
+ - Los registros quedan reducidos a identificadores y resultados.
++
++## Inmutabilidad y límites de proceso
++
++- La política y las definiciones de herramienta se construyen con atributos de seguridad inmutables por la API normal.
++- Este aislamiento evita modificaciones accidentales y rutas de configuración normales, pero no sustituye una frontera de seguridad absoluta frente a código malicioso que ya pueda ejecutar dentro del mismo proceso Python.
++- La autorización sigue siendo centralizada y la ejecución real permanece bloqueada en la fase actual.
+diff --git a/src/jarvis/conversation/pipeline.py b/src/jarvis/conversation/pipeline.py
+index ecf8b09..5996b7c 100644
+--- a/src/jarvis/conversation/pipeline.py
++++ b/src/jarvis/conversation/pipeline.py
+@@ -32,7 +32,12 @@ class ConversationPipeline:
+                 session_id=context.session_id,
+                 action_ref=proposal.action_ref,
+                 outcome="denied",
+-                details={"reason": "tool_not_registered", "tool_name": proposal.tool_name},
++                details={
++                    "reason": "tool_not_registered",
++                    "tool_name": proposal.tool_name,
++                    "authorization": "not_attempted",
++                    "execution_status": "denied",
++                },
+             )
+             return ConversationResult(
+                 user_text=user_input.text,
+@@ -49,7 +54,12 @@ class ConversationPipeline:
+                 session_id=context.session_id,
+                 action_ref=proposal.action_ref,
+                 outcome="denied",
+-                details={"reason": "authorization_failed", "tool": proposal.tool_name},
++                details={
++                    "reason": "authorization_failed",
++                    "tool_name": proposal.tool_name,
++                    "authorization": "denied",
++                    "execution_status": "blocked",
++                },
+             )
+             return ConversationResult(
+                 user_text=user_input.text,
+@@ -61,12 +71,40 @@ class ConversationPipeline:
+                 audit_id=audit_entry["audit_id"],
+             )
+ 
+-        result = self.tool_runner.execute(proposal, context)
++        try:
++            result = self.tool_runner.execute(proposal, context)
++        except Exception as exc:  # pragma: no cover - defensive guard
++            audit_entry = self.audit_logger.log(
++                session_id=context.session_id,
++                action_ref=proposal.action_ref,
++                outcome="error",
++                details={
++                    "tool_name": proposal.tool_name,
++                    "authorization": "granted",
++                    "execution_status": "error",
++                    "error_code": exc.__class__.__name__,
++                },
++            )
++            return ConversationResult(
++                user_text=user_input.text,
++                intent=str(intent.get("intent", "unknown")),
++                proposal=proposal,
++                authorized=True,
++                success=False,
++                error="Tool execution failed.",
++                audit_id=audit_entry["audit_id"],
++            )
++
+         audit_entry = self.audit_logger.log(
+             session_id=context.session_id,
+             action_ref=proposal.action_ref,
+             outcome="allowed",
+-            details={"tool": proposal.tool_name, "result": result},
++            details={
++                "tool_name": proposal.tool_name,
++                "authorization": "granted",
++                "execution_status": "completed",
++                "result_code": result.get("status") if isinstance(result, dict) else None,
++            },
+         )
+         return ConversationResult(
+             user_text=user_input.text,
+diff --git a/src/jarvis/security/audit.py b/src/jarvis/security/audit.py
+index 46371bb..6fe784a 100644
+--- a/src/jarvis/security/audit.py
++++ b/src/jarvis/security/audit.py
+@@ -10,8 +10,32 @@ class AuditLogger:
+     def __init__(self) -> None:
+         self.entries: list[dict[str, Any]] = []
+ 
++    @staticmethod
++    def _sanitize_details(details: dict[str, Any]) -> dict[str, Any]:
++        cleaned = redact_sensitive(details)
++        if not isinstance(cleaned, dict):
++            return {"value": "[REDACTED]"}
++        for key in list(cleaned):
++            lowered = str(key).lower()
++            if lowered in {
++                "user_text",
++                "message",
++                "prompt",
++                "conversation",
++                "content",
++                "response",
++                "result",
++                "tool_result",
++                "arguments",
++                "output",
++                "text",
++                "body",
++            }:
++                del cleaned[key]
++        return cleaned
++
+     def log(self, *, session_id: str, action_ref: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
+-        clean_details = redact_sensitive(details)
++        clean_details = self._sanitize_details(details)
+         entry = {
+             "audit_id": uuid.uuid4().hex[:12],
+             "session_id": session_id,
+diff --git a/src/jarvis/security/policy.py b/src/jarvis/security/policy.py
+index a177a7a..3991af1 100644
+--- a/src/jarvis/security/policy.py
++++ b/src/jarvis/security/policy.py
+@@ -1,11 +1,19 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Iterable
++from typing import Any
+ 
+ 
+ class SecurityPolicy:
+     __slots__ = ("default_deny", "mode", "identity_required", "_allowed_permissions")
+ 
++    def __setattr__(self, name: str, value: Any) -> None:
++        if name in {"default_deny", "mode", "identity_required", "_allowed_permissions"} and hasattr(self, name):
++            raise AttributeError(f"{name} is immutable after policy construction.")
++        if name == "allowed_permissions":
++            raise AttributeError("allowed_permissions is read-only; define the policy at construction time.")
++        super().__setattr__(name, value)
++
+     def __init__(
+         self,
+         *,
+@@ -14,10 +22,17 @@ class SecurityPolicy:
+         identity_required: bool = False,
+         allowed_permissions: Iterable[str] | None = None,
+     ) -> None:
++        if not isinstance(mode, str):
++            raise TypeError("mode must be a string.")
+         if mode != "simulated":
+             raise ValueError("Fase 1 only supports simulated mode.")
++        if not isinstance(default_deny, bool):
++            raise TypeError("default_deny must be a boolean.")
+         if default_deny is not True:
+             raise ValueError("Fase 1 requires deny-by-default policy semantics.")
++        if not isinstance(identity_required, bool):
++            raise TypeError("identity_required must be a boolean.")
++
+         self.default_deny = True
+         self.mode = mode
+         self.identity_required = bool(identity_required)
+@@ -39,6 +54,8 @@ class SecurityPolicy:
+     def _normalize_permissions(permissions: Iterable[str] | None) -> frozenset[str]:
+         if permissions is None:
+             return frozenset()
++        if isinstance(permissions, str):
++            raise TypeError("allowed_permissions must be an iterable of permission strings, not a single string.")
+         if not isinstance(permissions, Iterable):
+             raise TypeError("allowed_permissions must be an iterable of permission strings.")
+         normalized: set[str] = set()
+diff --git a/src/jarvis/tools/registry.py b/src/jarvis/tools/registry.py
+index c7abffb..4cc9b7c 100644
+--- a/src/jarvis/tools/registry.py
++++ b/src/jarvis/tools/registry.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from types import MappingProxyType
+ from typing import Any
+ 
+ from jarvis.core.context import ConversationContext
+@@ -28,6 +29,13 @@ class EchoTool(ToolDefinition):
+ 
+ 
+ class ToolRegistry:
++    __slots__ = ("_tools", "_sealed")
++
++    def __setattr__(self, name: str, value: Any) -> None:
++        if name in {"_tools", "_sealed"} and getattr(self, "_sealed", False):
++            raise AttributeError("Tool registry is frozen and cannot be modified.")
++        super().__setattr__(name, value)
++
+     def __init__(self) -> None:
+         self._tools: dict[str, ToolDefinition] = {}
+         self._sealed = False
+@@ -60,6 +68,7 @@ class ToolRegistry:
+         return sorted(self._tools)
+ 
+     def freeze(self) -> None:
++        self._tools = MappingProxyType(dict(self._tools))
+         self._sealed = True
+ 
+ 
+diff --git a/tests/unit/test_security.py b/tests/unit/test_security.py
+index b1d3e6e..d4aaa28 100644
+--- a/tests/unit/test_security.py
++++ b/tests/unit/test_security.py
+@@ -76,6 +76,24 @@ def test_policy_permissions_are_read_only() -> None:
+         policy.allowed_permissions.add("tool.other")
+ 
+ 
++def test_policy_security_fields_are_immutable() -> None:
++    policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})
++    with pytest.raises(AttributeError):
++        policy.default_deny = False
++    with pytest.raises(AttributeError):
++        policy.mode = "real"
++    with pytest.raises(AttributeError):
++        policy.identity_required = False
++
++
++def test_policy_instances_are_isolated() -> None:
++    policy_a = SecurityPolicy(allowed_permissions={"tool.echo_message"})
++    policy_b = SecurityPolicy(allowed_permissions={"tool.other"})
++    assert policy_a.allowed_permissions == frozenset({"tool.echo_message"})
++    assert policy_b.allowed_permissions == frozenset({"tool.other"})
++    assert policy_a.allowed_permissions is not policy_b.allowed_permissions
++
++
+ def test_invalid_permission_names_are_rejected() -> None:
+     with pytest.raises((TypeError, ValueError)):
+         SecurityPolicy(allowed_permissions={123})
+@@ -91,11 +109,13 @@ def test_simulator_cannot_grant_permissions() -> None:
+ 
+ def test_audit_logs_without_sensitive_data() -> None:
+     logger = AuditLogger()
++    unique_message = "user-provided-unique-marker-xyz-42"
+     entry = logger.log(
+         session_id="session-1",
+         action_ref="action-1",
+         outcome="denied",
+-        details={"password": "secret-value", "message": "hello"},
++        details={"password": "secret-value", "user_text": unique_message},
+     )
+     assert entry["details"]["password"] == "[REDACTED]"
+-    assert entry["details"]["message"] == "hello"
++    assert unique_message not in str(entry["details"])
++    assert "user_text" not in entry["details"]
+diff --git a/tests/unit/test_tools.py b/tests/unit/test_tools.py
+index 1fdeb6a..8532693 100644
+--- a/tests/unit/test_tools.py
++++ b/tests/unit/test_tools.py
+@@ -6,10 +6,27 @@ from jarvis.core.errors import AuthorizationError, SimulatedModeError, ToolNotRe
+ from jarvis.security.audit import AuditLogger
+ from jarvis.security.authorization import AuthorizationService
+ from jarvis.security.policy import SecurityPolicy
++from jarvis.tools.base import ToolDefinition
+ from jarvis.tools.registry import ToolRegistry, create_default_registry
+ from jarvis.tools.runner import SimulatedToolRunner
+ 
+ 
++class CountingTool(ToolDefinition):
++    def __init__(self, *, calls: dict[str, int]) -> None:
++        super().__init__()
++        self.calls = calls
++        self.name = "counting_tool"
++        self.description = "Test tool that counts calls."
++        self.required_permission = "tool.counting_tool"
++        self.risk_level = "low"
++        self.requires_confirmation = False
++        self.execution_mode = "simulated"
++
++    def execute(self, context: ConversationContext, **kwargs):
++        self.calls["count"] += 1
++        return {"kind": "counted", "message": kwargs.get("message", ""), "status": "ok"}
++
++
+ def test_authorized_simulated_tool_executes() -> None:
+     registry = create_default_registry()
+     policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})
+@@ -43,6 +60,8 @@ def test_unregistered_tool_is_denied_by_runner() -> None:
+ def test_real_execution_route_is_blocked() -> None:
+     registry = create_default_registry()
+     tool = registry.get("echo_message")
++    with pytest.raises(AttributeError):
++        tool.execution_mode = "real"
+     object.__setattr__(tool, "execution_mode", "real")
+     policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})
+     auth = AuthorizationService(policy=policy, registry=registry)
+@@ -58,24 +77,18 @@ def test_real_execution_route_is_blocked() -> None:
+ 
+ 
+ def test_authorization_error_stops_execution() -> None:
+-    registry = create_default_registry()
+-    auth = AuthorizationService(policy=SecurityPolicy(), registry=registry)
++    registry = ToolRegistry()
++    calls = {"count": 0}
++    registry.register(CountingTool(calls=calls))
++    policy = SecurityPolicy()
++    auth = AuthorizationService(policy=policy, registry=registry)
+     runner = SimulatedToolRunner(registry=registry, authorization_service=auth, mode="simulated")
+     context = ConversationContext.create("hello")
+     proposal = ToolProposal(
+-        tool_name="echo_message",
+-        permission="tool.echo_message",
++        tool_name="counting_tool",
++        permission="tool.counting_tool",
+         parameters={"message": "hello"},
+     )
+-    tool = registry.get("echo_message")
+-    original_execute = tool.execute
+-    calls = {"count": 0}
+-
+-    def fail_if_called(*args, **kwargs):
+-        calls["count"] += 1
+-        return original_execute(*args, **kwargs)
+-
+-    tool.execute = fail_if_called
+     with pytest.raises(AuthorizationError):
+         runner.execute(proposal, context)
+     assert calls["count"] == 0
+@@ -124,3 +137,12 @@ def test_registry_rejects_duplicate_tool_names() -> None:
+     registry.register(create_default_registry().get("echo_message"))
+     with pytest.raises(ValueError):
+         registry.register(create_default_registry().get("echo_message"))
++
++
++def test_registry_freeze_blocks_modification() -> None:
++    registry = ToolRegistry()
++    registry.freeze()
++    with pytest.raises(AttributeError):
++        registry._sealed = False
++    with pytest.raises((AttributeError, TypeError)):
++        registry._tools["extra"] = object()

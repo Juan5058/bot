@@ -1,0 +1,77 @@
+
+from pathlib import Path
+import shutil
+
+path = Path("src/jarvis/app.py")
+source = path.read_text(encoding="utf-8")
+
+import_line = "from jarvis.ai.contracts import AIProviderContract\n"
+new_import = (
+    import_line
+    + "from jarvis.ai.development_chat import DevelopmentOllamaChatProvider\n"
+)
+
+if "from jarvis.ai.development_chat import DevelopmentOllamaChatProvider" not in source:
+    if source.count(import_line) != 1:
+        raise SystemExit("ABORTADO: el import esperado no coincide.")
+    source = source.replace(import_line, new_import, 1)
+
+validation_anchor = (
+    '    else:\n'
+    '        settings = Settings.model_validate(settings.model_dump())\n'
+    '    if local_model_manager is not None:\n'
+)
+
+validation_replacement = (
+    '    else:\n'
+    '        settings = Settings.model_validate(settings.model_dump())\n'
+    '    if settings.local_development_chat_enabled and local_model_manager is not None:\n'
+    '        raise ValueError(\n'
+    '            "Development chat cannot be combined with the production model manager."\n'
+    '        )\n'
+    '    if local_model_manager is not None:\n'
+)
+
+if "Development chat cannot be combined with the production model manager." not in source:
+    if source.count(validation_anchor) != 1:
+        raise SystemExit("ABORTADO: el bloque de validación no coincide.")
+    source = source.replace(validation_anchor, validation_replacement, 1)
+
+old_catalog = '''    if ai_provider is not None and settings.ai_provider == "simulated":
+        provider_catalog: dict[str, AIProviderContract] = {
+            "simulated": ai_provider
+        }
+    elif local_model_manager is not None:
+        provider_catalog = {
+            "local": ManagedLocalAIProvider(local_model_manager)
+        }
+    else:
+        provider_catalog = {}
+'''
+
+new_catalog = '''    if settings.local_development_chat_enabled:
+        provider_catalog: dict[str, AIProviderContract] = {
+            "local": DevelopmentOllamaChatProvider(settings)
+        }
+    elif ai_provider is not None and settings.ai_provider == "simulated":
+        provider_catalog = {"simulated": ai_provider}
+    elif local_model_manager is not None:
+        provider_catalog = {
+            "local": ManagedLocalAIProvider(local_model_manager)
+        }
+    else:
+        provider_catalog = {}
+'''
+
+if "DevelopmentOllamaChatProvider(settings)" not in source:
+    if source.count(old_catalog) != 1:
+        raise SystemExit("ABORTADO: el catálogo de proveedores no coincide.")
+    source = source.replace(old_catalog, new_catalog, 1)
+
+backup = path.with_suffix(".py.pre-development-chat.bak")
+if not backup.exists():
+    shutil.copy2(path, backup)
+
+path.write_text(source, encoding="utf-8", newline="\n")
+print("OK: app.py integrado. Copia de seguridad:", backup)
+

@@ -1,0 +1,1252 @@
+[1mdiff --git a/src/jarvis/security/authorization.py b/src/jarvis/security/authorization.py[m
+[1mindex 1c8c3c6..7e6e006 100644[m
+[1m--- a/src/jarvis/security/authorization.py[m
+[1m+++ b/src/jarvis/security/authorization.py[m
+[36m@@ -1,42 +1,109 @@[m
+ from __future__ import annotations[m
+ [m
+[32m+[m[32mimport re[m
+[32m+[m
+[32m+[m[32mfrom jarvis.config.validation import validate_permission_name[m
+ from jarvis.conversation.models import ToolProposal[m
+ from jarvis.core.context import ConversationContext[m
+[31m-from jarvis.core.errors import AuthorizationError, ToolNotRegisteredError[m
+[32m+[m[32mfrom jarvis.core.errors import ToolNotRegisteredError[m
+ from jarvis.security.policy import SecurityPolicy[m
+ from jarvis.tools.registry import ToolRegistry[m
+ [m
+ [m
+[32m+[m[32m_SESSION_ID_PATTERN = re.compile(r"session-[0-9a-f]{8}\Z")[m
+[32m+[m[32m_ACTION_REF_PATTERN = re.compile(r"(?:|[A-Za-z0-9_.:-]{1,128})\Z")[m
+[32m+[m[32m_TOOL_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")[m
+[32m+[m[32m_RISK_LEVELS = frozenset({"low", "medium", "high"})[m
+[32m+[m
+[32m+[m
+ class AuthorizationService:[m
+[32m+[m[32m    def __setattr__(self, name: str, value: object) -> None:[m
+[32m+[m[32m        if name in {"policy", "_registry"} and hasattr(self, name):[m
+[32m+[m[32m            raise AttributeError(f"{name} is immutable after authorization service construction.")[m
+[32m+[m[32m        if name == "authorize":[m
+[32m+[m[32m            raise AttributeError("The authorization decision method cannot be replaced on an instance.")[m
+[32m+[m[32m        super().__setattr__(name, value)[m
+[32m+[m
+[32m+[m[32m    def __delattr__(self, name: str) -> None:[m
+[32m+[m[32m        if name in {"policy", "_registry", "authorize"}:[m
+[32m+[m[32m            raise AttributeError(f"{name} cannot be deleted from an authorization service.")[m
+[32m+[m[32m        super().__delattr__(name)[m
+[32m+[m
+     def __init__(self, policy: SecurityPolicy, registry: ToolRegistry) -> None:[m
+[32m+[m[32m        if type(policy) is not SecurityPolicy:[m
+[32m+[m[32m            raise TypeError("Authorization service requires the core security policy.")[m
+         self.policy = policy[m
+[31m-        self.registry = registry[m
+[32m+[m[32m        self._registry = registry[m
+[32m+[m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def registry(self) -> ToolRegistry:[m
+[32m+[m[32m        return self._registry[m
+ [m
+     def authorize(self, proposal: ToolProposal, context: ConversationContext) -> bool:[m
+[31m-        if not isinstance(proposal, ToolProposal):[m
+[31m-            raise AuthorizationError("Invalid proposal object.")[m
+[31m-        if context.mode != "simulated":[m
+[32m+[m[32m        if type(proposal) is not ToolProposal or type(context) is not ConversationContext:[m
+             return False[m
+[31m-        if not self.registry.has(proposal.tool_name):[m
+[31m-            raise ToolNotRegisteredError(f"Tool '{proposal.tool_name}' is not registered.")[m
+[31m-[m
+[31m-        if not proposal.permission:[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            type(context.mode) is not str[m
+[32m+[m[32m            or context.mode != "simulated"[m
+[32m+[m[32m            or type(context.session_id) is not str[m
+[32m+[m[32m            or not _SESSION_ID_PATTERN.fullmatch(context.session_id)[m
+[32m+[m[32m        ):[m
+             return False[m
+[31m-        if not self.policy.validate_required_inputs(proposal.permission, context):[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            type(proposal.tool_name) is not str[m
+[32m+[m[32m            or not _TOOL_NAME_PATTERN.fullmatch(proposal.tool_name)[m
+[32m+[m[32m            or type(proposal.permission) is not str[m
+[32m+[m[32m            or type(proposal.parameters) is not dict[m
+[32m+[m[32m            or any(type(key) is not str for key in proposal.parameters)[m
+[32m+[m[32m            or type(proposal.risk_level) is not str[m
+[32m+[m[32m            or proposal.risk_level not in _RISK_LEVELS[m
+[32m+[m[32m            or type(proposal.requires_confirmation) is not bool[m
+[32m+[m[32m            or (proposal.confirmation_token is not None and type(proposal.confirmation_token) is not str)[m
+[32m+[m[32m            or type(proposal.action_ref) is not str[m
+[32m+[m[32m            or not _ACTION_REF_PATTERN.fullmatch(proposal.action_ref)[m
+[32m+[m[32m        ):[m
+             return False[m
+[31m-        if not self.policy.can_execute(proposal.permission):[m
+[32m+[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            permission = validate_permission_name(proposal.permission)[m
+[32m+[m[32m            tool = self.registry.get(proposal.tool_name)[m
+[32m+[m[32m            trusted_definition = self.registry.get_trusted_definition(proposal.tool_name)[m
+[32m+[m[32m        except ToolNotRegisteredError:[m
+[32m+[m[32m            raise[m
+[32m+[m[32m        except (TypeError, ValueError, KeyError):[m
+             return False[m
+[31m-        if not self.policy.has_rule_for(proposal.permission):[m
+[32m+[m[32m        except Exception:[m
+             return False[m
+ [m
+[31m-        if proposal.requires_confirmation:[m
+[31m-            if not proposal.confirmation_token:[m
+[31m-                return False[m
+[31m-            if proposal.action_ref not in context.confirmed_actions:[m
+[31m-                return False[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            type(tool) is not trusted_definition.implementation_type[m
+[32m+[m[32m            or type(tool.name) is not str[m
+[32m+[m[32m            or tool.name != proposal.tool_name[m
+[32m+[m[32m            or type(trusted_definition.required_permission) is not str[m
+[32m+[m[32m            or type(trusted_definition.execution_mode) is not str[m
+[32m+[m[32m            or trusted_definition.execution_mode != "simulated"[m
+[32m+[m[32m            or trusted_definition.risk_level not in _RISK_LEVELS[m
+[32m+[m[32m            or tool.required_permission != trusted_definition.required_permission[m
+[32m+[m[32m            or tool.execution_mode != trusted_definition.execution_mode[m
+[32m+[m[32m            or tool.risk_level != trusted_definition.risk_level[m
+[32m+[m[32m            or tool.requires_confirmation != trusted_definition.requires_confirmation[m
+[32m+[m[32m            or proposal.risk_level != trusted_definition.risk_level[m
+[32m+[m[32m            or proposal.requires_confirmation != trusted_definition.requires_confirmation[m
+[32m+[m[32m            or type(tool._frozen) is not bool[m
+[32m+[m[32m            or not tool._frozen[m
+[32m+[m[32m        ):[m
+[32m+[m[32m            return False[m
+ [m
+[31m-        required_tool = self.registry.get(proposal.tool_name)[m
+[31m-        if required_tool.required_permission != proposal.permission:[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            trusted_definition.identity_required[m
+[32m+[m[32m            or trusted_definition.requires_confirmation[m
+[32m+[m[32m            or proposal.confirmation_token is not None[m
+[32m+[m[32m        ):[m
+             return False[m
+ [m
+[31m-        return True[m
+[32m+[m[32m        return ([m
+[32m+[m[32m            permission == trusted_definition.required_permission[m
+[32m+[m[32m            and self.policy.validate_required_inputs(permission, context)[m
+[32m+[m[32m            and self.policy.can_execute_tool(trusted_definition.name, permission)[m
+[32m+[m[32m            and self.policy.has_rule_for(permission)[m
+[32m+[m[32m        )[m
+[1mdiff --git a/src/jarvis/tools/runner.py b/src/jarvis/tools/runner.py[m
+[1mindex e010db6..d2856d9 100644[m
+[1m--- a/src/jarvis/tools/runner.py[m
+[1m+++ b/src/jarvis/tools/runner.py[m
+[36m@@ -4,26 +4,69 @@[m [mfrom typing import Any[m
+ [m
+ from jarvis.conversation.models import ToolProposal[m
+ from jarvis.core.context import ConversationContext[m
+[31m-from jarvis.core.errors import AuthorizationError, SimulatedModeError[m
+[32m+[m[32mfrom jarvis.core.errors import ([m
+[32m+[m[32m    AuthorizationError,[m
+[32m+[m[32m    SimulatedModeError,[m
+[32m+[m[32m    ToolExecutionError,[m
+[32m+[m[32m    ToolNotRegisteredError,[m
+[32m+[m[32m)[m
+ from jarvis.security.authorization import AuthorizationService[m
+ from jarvis.tools.registry import ToolRegistry[m
+ [m
+ [m
+ class SimulatedToolRunner:[m
+[32m+[m[32m    def __setattr__(self, name: str, value: Any) -> None:[m
+[32m+[m[32m        if name in {"_registry", "_authorization_service"} and hasattr(self, name):[m
+[32m+[m[32m            raise AttributeError(f"{name} is immutable after runner construction.")[m
+[32m+[m[32m        super().__setattr__(name, value)[m
+[32m+[m
+[32m+[m[32m    def __delattr__(self, name: str) -> None:[m
+[32m+[m[32m        if name in {"_registry", "_authorization_service"}:[m
+[32m+[m[32m            raise AttributeError(f"{name} cannot be deleted from a tool runner.")[m
+[32m+[m[32m        super().__delattr__(name)[m
+[32m+[m
+     def __init__(self, registry: ToolRegistry, authorization_service: AuthorizationService, mode: str = "simulated") -> None:[m
+[31m-        self.registry = registry[m
+[31m-        self.authorization_service = authorization_service[m
+[32m+[m[32m        if type(authorization_service) is not AuthorizationService:[m
+[32m+[m[32m            raise TypeError("Runner requires the core authorization service.")[m
+[32m+[m[32m        if registry is not authorization_service.registry:[m
+[32m+[m[32m            raise ValueError("Runner and authorization service must share the same tool registry.")[m
+[32m+[m[32m        self._registry = registry[m
+[32m+[m[32m        self._authorization_service = authorization_service[m
+         self.mode = mode[m
+ [m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def registry(self) -> ToolRegistry:[m
+[32m+[m[32m        return self._registry[m
+[32m+[m
+[32m+[m[32m    @property[m
+[32m+[m[32m    def authorization_service(self) -> AuthorizationService:[m
+[32m+[m[32m        return self._authorization_service[m
+[32m+[m
+     def execute(self, proposal: ToolProposal, context: ConversationContext) -> dict[str, Any]:[m
+[31m-        if self.mode != "simulated":[m
+[32m+[m[32m        if self.registry is not self.authorization_service.registry:[m
+[32m+[m[32m            raise AuthorizationError("Authorization could not be verified.")[m
+[32m+[m[32m        if type(self.mode) is not str or self.mode != "simulated":[m
+             raise SimulatedModeError("Only simulated mode is allowed in Fase 1.")[m
+[31m-        if not self.authorization_service.authorize(proposal, context):[m
+[31m-            raise AuthorizationError(f"Authorization denied for tool '{proposal.tool_name}'.")[m
+[31m-        tool = self.registry.get(proposal.tool_name)[m
+[31m-        if tool.execution_mode != "simulated":[m
+[32m+[m[32m        if type(proposal) is not ToolProposal or type(proposal.tool_name) is not str:[m
+[32m+[m[32m            raise AuthorizationError("Authorization denied.")[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            tool = self.registry.get(proposal.tool_name)[m
+[32m+[m[32m        except ToolNotRegisteredError:[m
+[32m+[m[32m            raise[m
+[32m+[m[32m        if type(tool.execution_mode) is not str or tool.execution_mode != "simulated":[m
+             raise SimulatedModeError("Real execution path is disabled.")[m
+[31m-        result = tool.execute(context, **proposal.parameters)[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            authorized = self.authorization_service.authorize(proposal, context)[m
+[32m+[m[32m        except ToolNotRegisteredError:[m
+[32m+[m[32m            raise[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            raise AuthorizationError("Authorization could not be verified.") from None[m
+[32m+[m[32m        if authorized is not True:[m
+[32m+[m[32m            raise AuthorizationError("Authorization denied.")[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            result = tool.execute(context, **proposal.parameters)[m
+[32m+[m[32m        except Exception:[m
+[32m+[m[32m            raise ToolExecutionError("Simulated tool execution failed.") from None[m
+         return {[m
+             "tool_name": proposal.tool_name,[m
+             "status": "simulated_ok",[m
+[1mdiff --git a/tests/unit/test_security.py b/tests/unit/test_security.py[m
+[1mindex b1d3e6e..8e71f94 100644[m
+[1m--- a/tests/unit/test_security.py[m
+[1m+++ b/tests/unit/test_security.py[m
+[36m@@ -1,13 +1,25 @@[m
+ import pytest[m
+ [m
+ from jarvis.ai.simulator import SimulatedAIProvider[m
+[32m+[m[32mfrom jarvis.app import create_application[m
+[32m+[m[32mfrom jarvis.config.settings import Settings[m
+ from jarvis.conversation.models import ToolProposal[m
+ from jarvis.core.context import ConversationContext[m
+ from jarvis.core.errors import ToolNotRegisteredError[m
+ from jarvis.security.audit import AuditLogger[m
+ from jarvis.security.authorization import AuthorizationService[m
+ from jarvis.security.policy import SecurityPolicy[m
+[31m-from jarvis.tools.registry import ToolRegistry, create_default_registry[m
+[32m+[m[32mfrom jarvis.tools.registry import EchoTool, ToolRegistry, create_default_registry[m
+[32m+[m[32mfrom jarvis.tools.runner import SimulatedToolRunner[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _use_policy_for_test(app, policy: SecurityPolicy) -> None:[m
+[32m+[m[32m    authorizer = AuthorizationService(policy=policy, registry=app.registry)[m
+[32m+[m[32m    app.authorizer = authorizer[m
+[32m+[m[32m    app.tool_runner = SimulatedToolRunner([m
+[32m+[m[32m        registry=app.registry,[m
+[32m+[m[32m        authorization_service=authorizer,[m
+[32m+[m[32m    )[m
+ [m
+ [m
+ def test_unknown_permission_is_denied() -> None:[m
+[36m@@ -35,6 +47,27 @@[m [mdef test_unregistered_tool_is_rejected() -> None:[m
+         auth.authorize(proposal, context)[m
+ [m
+ [m
+[32m+[m[32mdef test_proposal_with_malformed_or_manipulated_fields_is_denied() -> None:[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    auth = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy(allowed_permissions={"tool.echo_message"}),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    context = ConversationContext.create("hello")[m
+[32m+[m
+[32m+[m[32m    malformed = ([m
+[32m+[m[32m        ToolProposal(tool_name="echo_message", permission=123, parameters={"message": "hello"}),[m
+[32m+[m[32m        ToolProposal(tool_name="echo_message", permission="tool.echo_message", risk_level="critical"),[m
+[32m+[m[32m        ToolProposal([m
+[32m+[m[32m            tool_name="echo_message",[m
+[32m+[m[32m            permission="tool.echo_message",[m
+[32m+[m[32m            requires_confirmation="false",[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        ToolProposal(tool_name="echo_message", permission="tool.echo_message", parameters=[]),[m
+[32m+[m[32m    )[m
+[32m+[m[32m    assert all(auth.authorize(proposal, context) is False for proposal in malformed)[m
+[32m+[m
+[32m+[m
+ def test_missing_authorization_is_denied() -> None:[m
+     registry = create_default_registry()[m
+     policy = SecurityPolicy()[m
+[36m@@ -68,12 +101,106 @@[m [mdef test_context_cannot_grant_permissions() -> None:[m
+ [m
+ [m
+ def test_policy_permissions_are_read_only() -> None:[m
+[31m-    policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})[m
+[32m+[m[32m    policy = SecurityPolicy([m
+[32m+[m[32m        allowed_permissions={"tool.echo_message"},[m
+[32m+[m[32m        allowed_tool_permissions={("echo_message", "tool.echo_message")},[m
+[32m+[m[32m    )[m
+     assert policy.allowed_permissions == frozenset({"tool.echo_message"})[m
+[32m+[m[32m    assert policy.allowed_tool_permissions == frozenset({("echo_message", "tool.echo_message")})[m
+     with pytest.raises(AttributeError):[m
+         policy.allowed_permissions = {"tool.other"}[m
+     with pytest.raises(AttributeError):[m
+         policy.allowed_permissions.add("tool.other")[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        policy.allowed_tool_permissions = {("other_echo", "tool.echo_message")}[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_policy_security_fields_are_immutable() -> None:[m
+[32m+[m[32m    policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})[m
+[32m+[m[32m    for attribute, value in ([m
+[32m+[m[32m        ("default_deny", False),[m
+[32m+[m[32m        ("mode", "real"),[m
+[32m+[m[32m        ("identity_required", False),[m
+[32m+[m[32m    ):[m
+[32m+[m[32m        with pytest.raises(AttributeError):[m
+[32m+[m[32m            setattr(policy, attribute, value)[m
+[32m+[m[32m        with pytest.raises(AttributeError):[m
+[32m+[m[32m            delattr(policy, attribute)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_policy_instances_are_isolated() -> None:[m
+[32m+[m[32m    policy_a = SecurityPolicy(allowed_permissions={"tool.echo_message"})[m
+[32m+[m[32m    policy_b = SecurityPolicy(allowed_permissions={"tool.other"})[m
+[32m+[m[32m    assert policy_a.allowed_permissions == frozenset({"tool.echo_message"})[m
+[32m+[m[32m    assert policy_b.allowed_permissions == frozenset({"tool.other"})[m
+[32m+[m[32m    assert policy_a.allowed_permissions is not policy_b.allowed_permissions[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_identity_required_denies_context_and_unverified_claims() -> None:[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    auth = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy([m
+[32m+[m[32m            identity_required=True,[m
+[32m+[m[32m            allowed_permissions={"tool.echo_message"},[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    context = ConversationContext.create([m
+[32m+[m[32m        "hello",[m
+[32m+[m[32m        claims={"identity_verified": True, "user_id": "claimed-user"},[m
+[32m+[m[32m    )[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.echo_message",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    assert auth.authorize(proposal, context) is False[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_authorization_rejects_invalid_session_and_mode() -> None:[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    auth = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy(allowed_permissions={"tool.echo_message"}),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.echo_message",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    invalid_session = ConversationContext.create("hello")[m
+[32m+[m[32m    invalid_session.session_id = "model-supplied-session"[m
+[32m+[m[32m    assert auth.authorize(proposal, invalid_session) is False[m
+[32m+[m
+[32m+[m[32m    invalid_mode = ConversationContext.create("hello")[m
+[32m+[m[32m    invalid_mode.mode = "real"[m
+[32m+[m[32m    assert auth.authorize(proposal, invalid_mode) is False[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_configuration_rejects_malformed_permission_names() -> None:[m
+[32m+[m[32m    with pytest.raises(ValueError):[m
+[32m+[m[32m        SecurityPolicy(allowed_permissions={"tool.bad permission"})[m
+[32m+[m[32m    with pytest.raises(TypeError):[m
+[32m+[m[32m        SecurityPolicy(allowed_permissions="tool.echo_message")[m
+[32m+[m[32m    with pytest.raises(ValueError):[m
+[32m+[m[32m        SecurityPolicy(allowed_permissions={"tool..echo"})[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_policy_permission_is_bound_to_the_exact_tool_name() -> None:[m
+[32m+[m[32m    policy = SecurityPolicy.for_application()[m
+[32m+[m
+[32m+[m[32m    assert policy.can_execute_tool("echo_message", "tool.echo_message") is True[m
+[32m+[m[32m    assert policy.can_execute_tool("different_tool", "tool.echo_message") is False[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_policy_rejects_tool_permission_pair_not_in_permission_allowlist() -> None:[m
+[32m+[m[32m    with pytest.raises(ValueError, match="must also be allowed"):[m
+[32m+[m[32m        SecurityPolicy([m
+[32m+[m[32m            allowed_permissions={"tool.echo_message"},[m
+[32m+[m[32m            allowed_tool_permissions={("different_tool", "tool.different_tool")},[m
+[32m+[m[32m        )[m
+ [m
+ [m
+ def test_invalid_permission_names_are_rejected() -> None:[m
+[36m@@ -91,11 +218,183 @@[m [mdef test_simulator_cannot_grant_permissions() -> None:[m
+ [m
+ def test_audit_logs_without_sensitive_data() -> None:[m
+     logger = AuditLogger()[m
+[32m+[m[32m    unique_message = "user-provided-unique-marker-xyz-42"[m
+     entry = logger.log([m
+[31m-        session_id="session-1",[m
+[31m-        action_ref="action-1",[m
+[32m+[m[32m        session_id="session-12345678",[m
+[32m+[m[32m        action_ref="echo:0123456789ab",[m
+         outcome="denied",[m
+[31m-        details={"password": "secret-value", "message": "hello"},[m
+[32m+[m[32m        details={[m
+[32m+[m[32m            "reason": "authorization_failed",[m
+[32m+[m[32m            "tool_name": "echo_message",[m
+[32m+[m[32m            "authorization": "denied",[m
+[32m+[m[32m            "execution_status": "blocked",[m
+[32m+[m[32m            "password": unique_message,[m
+[32m+[m[32m            "user_text": unique_message,[m
+[32m+[m[32m            "nested": {"message": unique_message, "items": [unique_message]},[m
+[32m+[m[32m            "result": {"text": unique_message},[m
+[32m+[m[32m            "unknown_field": unique_message,[m
+[32m+[m[32m        },[m
+     )[m
+[31m-    assert entry["details"]["password"] == "[REDACTED]"[m
+[31m-    assert entry["details"]["message"] == "hello"[m
+[32m+[m[32m    assert entry["details"] == {[m
+[32m+[m[32m        "reason": "authorization_failed",[m
+[32m+[m[32m        "authorization": "denied",[m
+[32m+[m[32m        "execution_status": "blocked",[m
+[32m+[m[32m        "tool_name": "echo_message",[m
+[32m+[m[32m    }[m
+[32m+[m[32m    assert unique_message not in str(entry)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_audit_rejects_invalid_values_and_bounds_identifiers() -> None:[m
+[32m+[m[32m    logger = AuditLogger()[m
+[32m+[m[32m    marker = "invalid-audit-value-marker"[m
+[32m+[m[32m    entry = logger.log([m
+[32m+[m[32m        session_id=f"session-{marker}",[m
+[32m+[m[32m        action_ref="a" * 100,[m
+[32m+[m[32m        outcome=marker,[m
+[32m+[m[32m        details={[m
+[32m+[m[32m            "tool_name": {"nested": marker},[m
+[32m+[m[32m            "authorization": marker,[m
+[32m+[m[32m            "execution_status": ["completed", marker],[m
+[32m+[m[32m            "error_code": marker,[m
+[32m+[m[32m            "result_code": marker,[m
+[32m+[m[32m            "reason": "authorization_failed",[m
+[32m+[m[32m        },[m
+[32m+[m[32m    )[m
+[32m+[m[32m    assert entry["session_id"] == "invalid-session"[m
+[32m+[m[32m    assert entry["action_ref"] == "invalid-action"[m
+[32m+[m[32m    assert entry["outcome"] == "error"[m
+[32m+[m[32m    assert entry["details"] == {"reason": "authorization_failed"}[m
+[32m+[m[32m    assert marker not in str(entry)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_pipeline_audit_keeps_only_allowlisted_metadata() -> None:[m
+[32m+[m[32m    marker = "pipeline-result-private-marker"[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m[32m    result = app.process(marker)[m
+[32m+[m
+[32m+[m[32m    assert result.success is True[m
+[32m+[m[32m    assert marker not in str(app.audit_logger.entries)[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["outcome"] == "allowed"[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["details"] == {[m
+[32m+[m[32m        "authorization": "granted",[m
+[32m+[m[32m        "execution_status": "completed",[m
+[32m+[m[32m        "result_code": "simulated_ok",[m
+[32m+[m[32m        "tool_name": "echo_message",[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_pipeline_does_not_audit_exception_messages(monkeypatch) -> None:[m
+[32m+[m[32m    marker = "exception-private-marker"[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m
+[32m+[m[32m    def fail_with_sensitive_message(self, *args, **kwargs):[m
+[32m+[m[32m        raise RuntimeError(marker)[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", fail_with_sensitive_message)[m
+[32m+[m[32m    result = app.process("hello")[m
+[32m+[m
+[32m+[m[32m    assert result.success is False[m
+[32m+[m[32m    assert result.error == "Tool execution failed."[m
+[32m+[m[32m    assert marker not in str(app.audit_logger.entries)[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["outcome"] == "error"[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["details"] == {[m
+[32m+[m[32m        "authorization": "granted",[m
+[32m+[m[32m        "execution_status": "error",[m
+[32m+[m[32m        "error_code": "tool_execution_failed",[m
+[32m+[m[32m        "tool_name": "echo_message",[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_pipeline_denial_audit_preserves_operational_metadata(monkeypatch) -> None:[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m[32m    _use_policy_for_test(app, SecurityPolicy())[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m
+[32m+[m[32m    def count_if_called(self, context, **kwargs):[m
+[32m+[m[32m        calls["count"] += 1[m
+[32m+[m[32m        return {"status": "unexpected"}[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", count_if_called)[m
+[32m+[m
+[32m+[m[32m    result = app.process("hello")[m
+[32m+[m
+[32m+[m[32m    assert result.authorized is False[m
+[32m+[m[32m    assert result.success is False[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["outcome"] == "denied"[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["details"] == {[m
+[32m+[m[32m        "reason": "authorization_failed",[m
+[32m+[m[32m        "authorization": "denied",[m
+[32m+[m[32m        "execution_status": "blocked",[m
+[32m+[m[32m        "tool_name": "echo_message",[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_audit_failure_does_not_allow_a_denied_tool(monkeypatch) -> None:[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m[32m    _use_policy_for_test(app, SecurityPolicy())[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m
+[32m+[m[32m    def count_if_called(self, context, **kwargs):[m
+[32m+[m[32m        calls["count"] += 1[m
+[32m+[m[32m        return {"status": "unexpected"}[m
+[32m+[m
+[32m+[m[32m    def fail_audit(**kwargs):[m
+[32m+[m[32m        raise RuntimeError("audit unavailable")[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", count_if_called)[m
+[32m+[m[32m    monkeypatch.setattr(app.audit_logger, "log", fail_audit)[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(RuntimeError, match="audit unavailable"):[m
+[32m+[m[32m        app.process("hello")[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_ai_provider_cannot_mutate_authoritative_context() -> None:[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m[32m    simulator = SimulatedAIProvider()[m
+[32m+[m
+[32m+[m[32m    class MutatingProvider:[m
+[32m+[m[32m        def classify_intent(self, user_text):[m
+[32m+[m[32m            return simulator.classify_intent(user_text)[m
+[32m+[m
+[32m+[m[32m        def propose_action(self, user_text, context):[m
+[32m+[m[32m            context.mode = "real"[m
+[32m+[m[32m            context.session_id = "attacker-session"[m
+[32m+[m[32m            context.confirmed_actions.add("forged-action")[m
+[32m+[m[32m            context.claims["identity_verified"] = True[m
+[32m+[m[32m            return simulator.propose_action(user_text, context)[m
+[32m+[m
+[32m+[m[32m        def respond(self, user_text, context):[m
+[32m+[m[32m            return simulator.respond(user_text, context)[m
+[32m+[m
+[32m+[m[32m    app.ai_provider = MutatingProvider()[m
+[32m+[m[32m    result = app.process("hello")[m
+[32m+[m
+[32m+[m[32m    assert result.success is True[m
+[32m+[m[32m    assert result.authorized is True[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["outcome"] == "allowed"[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_malformed_provider_proposal_is_denied_without_leaking_data() -> None:[m
+[32m+[m[32m    marker = "malformed-proposal-private-marker"[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m
+[32m+[m[32m    class MalformedProvider:[m
+[32m+[m[32m        def classify_intent(self, user_text):[m
+[32m+[m[32m            return {"intent": "text_request"}[m
+[32m+[m
+[32m+[m[32m        def propose_action(self, user_text, context):[m
+[32m+[m[32m            return {"tool_name": marker, "permission": "tool.echo_message"}[m
+[32m+[m
+[32m+[m[32m        def respond(self, user_text, context):[m
+[32m+[m[32m            return marker[m
+[32m+[m
+[32m+[m[32m    app.ai_provider = MalformedProvider()[m
+[32m+[m[32m    result = app.process("hello")[m
+[32m+[m
+[32m+[m[32m    assert result.success is False[m
+[32m+[m[32m    assert result.authorized is False[m
+[32m+[m[32m    assert result.error == "Request was denied."[m
+[32m+[m[32m    assert marker not in str(app.audit_logger.entries)[m
+[32m+[m[32m    assert app.audit_logger.entries[0]["outcome"] == "denied"[m
+[1mdiff --git a/tests/unit/test_tools.py b/tests/unit/test_tools.py[m
+[1mindex 1fdeb6a..d615d7f 100644[m
+[1m--- a/tests/unit/test_tools.py[m
+[1m+++ b/tests/unit/test_tools.py[m
+[36m@@ -1,18 +1,115 @@[m
+[32m+[m[32mfrom typing import Any[m
+[32m+[m
+ import pytest[m
+ [m
+[32m+[m[32mfrom jarvis.app import create_application[m
+ from jarvis.conversation.models import ToolProposal[m
+ from jarvis.core.context import ConversationContext[m
+ from jarvis.core.errors import AuthorizationError, SimulatedModeError, ToolNotRegisteredError[m
+[32m+[m[32mfrom jarvis.config.settings import Settings[m
+ from jarvis.security.audit import AuditLogger[m
+ from jarvis.security.authorization import AuthorizationService[m
+ from jarvis.security.policy import SecurityPolicy[m
+[31m-from jarvis.tools.registry import ToolRegistry, create_default_registry[m
+[32m+[m[32mfrom jarvis.tools.base import ToolDefinition[m
+[32m+[m[32mfrom jarvis.tools.registry import ([m
+[32m+[m[32m    EchoTool,[m
+[32m+[m[32m    ToolRegistry,[m
+[32m+[m[32m    TrustedToolDefinition,[m
+[32m+[m[32m    create_default_registry,[m
+[32m+[m[32m)[m
+ from jarvis.tools.runner import SimulatedToolRunner[m
+ [m
+ [m
+[32m+[m[32mclass CountingTool(ToolDefinition):[m
+[32m+[m[32m    __slots__ = ("calls",)[m
+[32m+[m
+[32m+[m[32m    def __init__(self, *, calls: dict[str, int]) -> None:[m
+[32m+[m[32m        super().__init__()[m
+[32m+[m[32m        self.calls = calls[m
+[32m+[m[32m        self.name = "counting_tool"[m
+[32m+[m[32m        self.description = "Test tool that counts calls."[m
+[32m+[m[32m        self.required_permission = "tool.counting_tool"[m
+[32m+[m[32m        self.risk_level = "low"[m
+[32m+[m[32m        self.requires_confirmation = False[m
+[32m+[m[32m        self.execution_mode = "simulated"[m
+[32m+[m
+[32m+[m[32m    def execute(self, context: ConversationContext, **kwargs: Any) -> dict[str, Any]:[m
+[32m+[m[32m        self.calls["count"] += 1[m
+[32m+[m[32m        return {"kind": "counted", "message": kwargs.get("message", ""), "status": "ok"}[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass ConfirmingTool(CountingTool):[m
+[32m+[m[32m    __slots__ = ()[m
+[32m+[m
+[32m+[m[32m    def __init__(self, *, calls: dict[str, int]) -> None:[m
+[32m+[m[32m        super().__init__(calls=calls)[m
+[32m+[m[32m        self.name = "confirming_tool"[m
+[32m+[m[32m        self.required_permission = "tool.confirming_tool"[m
+[32m+[m[32m        self.risk_level = "high"[m
+[32m+[m[32m        self.requires_confirmation = True[m
+[32m+[m
+[32m+[m
+[32m+[m[32mclass AlternativeEchoTool(EchoTool):[m
+[32m+[m[32m    __slots__ = ("calls",)[m
+[32m+[m
+[32m+[m[32m    def __init__(self, *, calls: dict[str, int]) -> None:[m
+[32m+[m[32m        super().__init__()[m
+[32m+[m[32m        self.calls = calls[m
+[32m+[m
+[32m+[m[32m    def execute(self, context: ConversationContext, **kwargs: Any) -> dict[str, Any]:[m
+[32m+[m[32m        self.calls["count"] += 1[m
+[32m+[m[32m        return {"kind": "alternative_echo", "status": "ok"}[m
+[32m+[m
+[32m+[m
+[32m+[m[32m_COUNTING_TOOL_DEFINITION = TrustedToolDefinition([m
+[32m+[m[32m    name="counting_tool",[m
+[32m+[m[32m    implementation_type=CountingTool,[m
+[32m+[m[32m    required_permission="tool.counting_tool",[m
+[32m+[m[32m)[m
+[32m+[m[32m_CONFIRMING_TOOL_DEFINITION = TrustedToolDefinition([m
+[32m+[m[32m    name="confirming_tool",[m
+[32m+[m[32m    implementation_type=ConfirmingTool,[m
+[32m+[m[32m    required_permission="tool.confirming_tool",[m
+[32m+[m[32m    risk_level="high",[m
+[32m+[m[32m    requires_confirmation=True,[m
+[32m+[m[32m)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _registry_for([m
+[32m+[m[32m    definition: TrustedToolDefinition,[m
+[32m+[m[32m    tool: ToolDefinition,[m
+[32m+[m[32m) -> ToolRegistry:[m
+[32m+[m[32m    registry = ToolRegistry.for_trusted_composition({definition.name: definition})[m
+[32m+[m[32m    registry.register(tool)[m
+[32m+[m[32m    return registry[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _alternative_echo_registry(calls: dict[str, int]) -> ToolRegistry:[m
+[32m+[m[32m    definition = TrustedToolDefinition([m
+[32m+[m[32m        name="echo_message",[m
+[32m+[m[32m        implementation_type=AlternativeEchoTool,[m
+[32m+[m[32m        required_permission="tool.echo_message",[m
+[32m+[m[32m        risk_level="low",[m
+[32m+[m[32m        requires_confirmation=False,[m
+[32m+[m[32m        identity_required=False,[m
+[32m+[m[32m        execution_mode="simulated",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    registry = ToolRegistry.for_trusted_composition({"echo_message": definition})[m
+[32m+[m[32m    registry.register(AlternativeEchoTool(calls=calls))[m
+[32m+[m[32m    registry.freeze()[m
+[32m+[m[32m    return registry[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _policy_for(tool_name: str, permission: str) -> SecurityPolicy:[m
+[32m+[m[32m    return SecurityPolicy([m
+[32m+[m[32m        allowed_permissions={permission},[m
+[32m+[m[32m        allowed_tool_permissions={(tool_name, permission)},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+ def test_authorized_simulated_tool_executes() -> None:[m
+     registry = create_default_registry()[m
+[31m-    policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})[m
+[32m+[m[32m    policy = _policy_for("echo_message", "tool.echo_message")[m
+     auth = AuthorizationService(policy=policy, registry=registry)[m
+     runner = SimulatedToolRunner(registry=registry, authorization_service=auth, mode="simulated")[m
+     context = ConversationContext.create("hello")[m
+[36m@@ -26,9 +123,258 @@[m [mdef test_authorized_simulated_tool_executes() -> None:[m
+     assert result["status"] == "simulated_ok"[m
+ [m
+ [m
+[31m-def test_unregistered_tool_is_denied_by_runner() -> None:[m
+[32m+[m[32mdef test_default_application_uses_shared_registry_and_echo_permission() -> None:[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m
+[32m+[m[32m    result = app.process("hello")[m
+[32m+[m
+[32m+[m[32m    assert app.registry.list_names() == ["echo_message"][m
+[32m+[m[32m    assert app.registry is app.tool_runner.registry[m
+[32m+[m[32m    assert app.registry is app.authorizer.registry[m
+[32m+[m[32m    assert app.authorizer.policy.can_execute_tool("echo_message", "tool.echo_message")[m
+[32m+[m[32m    assert result.success is True[m
+[32m+[m[32m    assert result.authorized is True[m
+[32m+[m[32m    assert result.tool_result is not None[m
+[32m+[m[32m    assert result.tool_result["status"] == "simulated_ok"[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_default_registry_constructor_does_not_accept_custom_catalog() -> None:[m
+[32m+[m[32m    with pytest.raises(TypeError):[m
+[32m+[m[32m        ToolRegistry(trusted_catalog={})[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_runner_rejects_different_registry_before_alternative_handler_runs() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    trusted_registry = create_default_registry()[m
+[32m+[m[32m    alternative_registry = _alternative_echo_registry(calls)[m
+[32m+[m
+[32m+[m[32m    authorization_service = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy.for_application(),[m
+[32m+[m[32m        registry=trusted_registry,[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(ValueError, match="must share the same tool registry"):[m
+[32m+[m[32m        SimulatedToolRunner([m
+[32m+[m[32m            registry=alternative_registry,[m
+[32m+[m[32m            authorization_service=authorization_service,[m
+[32m+[m[32m        )[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_runner_rejects_fake_authorizer_with_shared_registry(monkeypatch) -> None:[m
+[32m+[m[32m    calls = {"handler": 0, "authorize": 0}[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.unapproved",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    def counted_echo(context: ConversationContext, **kwargs: Any) -> dict[str, Any]:[m
+[32m+[m[32m        calls["handler"] += 1[m
+[32m+[m[32m        return {"status": "ok"}[m
+[32m+[m
+[32m+[m[32m    class AlwaysAllowAuthorizer:[m
+[32m+[m[32m        def __init__(self, shared_registry: ToolRegistry) -> None:[m
+[32m+[m[32m            self.registry = shared_registry[m
+[32m+[m
+[32m+[m[32m        def authorize(self, proposal: ToolProposal, context: ConversationContext) -> bool:[m
+[32m+[m[32m            calls["authorize"] += 1[m
+[32m+[m[32m            return True[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", counted_echo)[m
+[32m+[m[32m    replacement = AlwaysAllowAuthorizer(registry)[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(TypeError, match="core authorization service"):[m
+[32m+[m[32m        SimulatedToolRunner(registry, replacement)  # type: ignore[arg-type][m
+[32m+[m
+[32m+[m[32m    assert calls == {"handler": 0, "authorize": 0}[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_runner_registry_reassignment_is_rejected_and_integrity_checked() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    authorization_service = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy.for_application(),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, authorization_service)[m
+[32m+[m[32m    alternative_registry = _alternative_echo_registry(calls)[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.echo_message",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        setattr(runner, "registry", alternative_registry)[m
+[32m+[m
+[32m+[m[32m    # Simulate internal state corruption, beyond the ordinary API.[m
+[32m+[m[32m    runner.__dict__["_registry"] = alternative_registry[m
+[32m+[m[32m    with pytest.raises(AuthorizationError, match="could not be verified"):[m
+[32m+[m[32m        runner.execute(proposal, ConversationContext.create("hello"))[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_authorizer_registry_reassignment_is_rejected_and_integrity_checked() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    authorization_service = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy.for_application(),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, authorization_service)[m
+[32m+[m[32m    alternative_registry = _alternative_echo_registry(calls)[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.echo_message",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        setattr(authorization_service, "registry", alternative_registry)[m
+[32m+[m
+[32m+[m[32m    # Simulate internal state corruption, beyond the ordinary API.[m
+[32m+[m[32m    authorization_service.__dict__["_registry"] = alternative_registry[m
+[32m+[m[32m    with pytest.raises(AuthorizationError, match="could not be verified"):[m
+[32m+[m[32m        runner.execute(proposal, ConversationContext.create("hello"))[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_runner_authorizer_replacement_is_rejected_before_unapproved_tool_execution(monkeypatch) -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    app = create_application(Settings(mode="simulated", ai_enabled=False))[m
+[32m+[m
+[32m+[m[32m    def counted_echo(context: ConversationContext, **kwargs: Any) -> dict[str, Any]:[m
+[32m+[m[32m        calls["count"] += 1[m
+[32m+[m[32m        return {"kind": "counted_echo", "status": "ok"}[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", counted_echo)[m
+[32m+[m[32m    replacement_authorizer = type([m
+[32m+[m[32m        "AlwaysAllowAuthorizer",[m
+[32m+[m[32m        (),[m
+[32m+[m[32m        {[m
+[32m+[m[32m            "registry": app.registry,[m
+[32m+[m[32m            "authorize": lambda self, proposal, context: True,[m
+[32m+[m[32m        },[m
+[32m+[m[32m    )()[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        app.tool_runner._authorization_service = replacement_authorizer[m
+[32m+[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.unapproved",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m[32m    with pytest.raises(AuthorizationError):[m
+[32m+[m[32m        app.tool_runner.execute(proposal, ConversationContext.create("hello"))[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_coordinated_registry_replacement_is_rejected_before_alternative_execution() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    authorization_service = AuthorizationService([m
+[32m+[m[32m        policy=SecurityPolicy.for_application(),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, authorization_service)[m
+[32m+[m[32m    alternative_registry = _alternative_echo_registry(calls)[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        runner._registry = alternative_registry[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        authorization_service._registry = alternative_registry[m
+[32m+[m
+[32m+[m[32m    assert runner.registry is registry[m
+[32m+[m[32m    assert authorization_service.registry is registry[m
+[32m+[m[32m    result = runner.execute([m
+[32m+[m[32m        ToolProposal([m
+[32m+[m[32m            tool_name="echo_message",[m
+[32m+[m[32m            permission="tool.echo_message",[m
+[32m+[m[32m            parameters={"message": "hello"},[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        ConversationContext.create("hello"),[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    assert result["status"] == "simulated_ok"[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_authorization_service_policy_is_immutable(monkeypatch) -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = create_default_registry()[m
+[32m+[m[32m    policy = SecurityPolicy([m
+[32m+[m[32m        identity_required=True,[m
+[32m+[m[32m        allowed_permissions={"tool.echo_message"},[m
+[32m+[m[32m        allowed_tool_permissions={("echo_message", "tool.echo_message")},[m
+[32m+[m[32m    )[m
+[32m+[m[32m    authorization_service = AuthorizationService(policy, registry)[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, authorization_service)[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.echo_message",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m[32m    context = ConversationContext.create("hello")[m
+[32m+[m
+[32m+[m[32m    def counted_echo(tool_context: ConversationContext, **kwargs: Any) -> dict[str, Any]:[m
+[32m+[m[32m        calls["count"] += 1[m
+[32m+[m[32m        return {"status": "ok"}[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", counted_echo)[m
+[32m+[m
+[32m+[m[32m    assert authorization_service.authorize(proposal, context) is False[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        authorization_service.policy = SecurityPolicy.for_application()[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        del authorization_service.policy[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(AuthorizationError):[m
+[32m+[m[32m        runner.execute(proposal, context)[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_authorization_method_cannot_be_replaced_to_approve_unknown_permission(monkeypatch) -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+     registry = create_default_registry()[m
+[31m-    auth = AuthorizationService(policy=SecurityPolicy(), registry=registry)[m
+[32m+[m[32m    authorization_service = AuthorizationService(SecurityPolicy.for_application(), registry)[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, authorization_service)[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="echo_message",[m
+[32m+[m[32m        permission="tool.unapproved",[m
+[32m+[m[32m        parameters={"message": "hello"},[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    def counted_echo(context: ConversationContext, **kwargs: Any) -> dict[str, Any]:[m
+[32m+[m[32m        calls["count"] += 1[m
+[32m+[m[32m        return {"status": "ok"}[m
+[32m+[m
+[32m+[m[32m    monkeypatch.setattr(EchoTool, "execute", counted_echo)[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        authorization_service.authorize = lambda proposal, context: True  # type: ignore[method-assign][m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        del authorization_service.authorize[m
+[32m+[m[32m    with pytest.raises(AuthorizationError):[m
+[32m+[m[32m        runner.execute(proposal, ConversationContext.create("hello"))[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_unregistered_tool_is_denied_by_runner() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = _registry_for(_COUNTING_TOOL_DEFINITION, CountingTool(calls=calls))[m
+[32m+[m[32m    auth = AuthorizationService([m
+[32m+[m[32m        policy=_policy_for("counting_tool", "tool.counting_tool"),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+     runner = SimulatedToolRunner(registry=registry, authorization_service=auth, mode="simulated")[m
+     context = ConversationContext.create("hello")[m
+     proposal = ToolProposal([m
+[36m@@ -38,13 +384,27 @@[m [mdef test_unregistered_tool_is_denied_by_runner() -> None:[m
+     )[m
+     with pytest.raises(ToolNotRegisteredError):[m
+         runner.execute(proposal, context)[m
+[32m+[m[32m    assert calls["count"] == 0[m
+ [m
+ [m
+ def test_real_execution_route_is_blocked() -> None:[m
+     registry = create_default_registry()[m
+     tool = registry.get("echo_message")[m
+[32m+[m[32m    for attribute, value in ([m
+[32m+[m[32m        ("execution_mode", "real"),[m
+[32m+[m[32m        ("required_permission", "tool.other"),[m
+[32m+[m[32m        ("name", "replacement"),[m
+[32m+[m[32m        ("risk_level", "high"),[m
+[32m+[m[32m        ("requires_confirmation", True),[m
+[32m+[m[32m        ("_frozen", False),[m
+[32m+[m[32m        ("execute", lambda *args, **kwargs: {}),[m
+[32m+[m[32m    ):[m
+[32m+[m[32m        with pytest.raises(AttributeError):[m
+[32m+[m[32m            setattr(tool, attribute, value)[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        del tool._frozen[m
+     object.__setattr__(tool, "execution_mode", "real")[m
+[31m-    policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})[m
+[32m+[m[32m    policy = _policy_for("echo_message", "tool.echo_message")[m
+     auth = AuthorizationService(policy=policy, registry=registry)[m
+     runner = SimulatedToolRunner(registry=registry, authorization_service=auth, mode="simulated")[m
+     context = ConversationContext.create("hello")[m
+[36m@@ -57,60 +417,138 @@[m [mdef test_real_execution_route_is_blocked() -> None:[m
+         runner.execute(proposal, context)[m
+ [m
+ [m
+[32m+[m[32mdef test_runner_rejects_non_simulated_mode_before_tool_execution() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = _registry_for(_COUNTING_TOOL_DEFINITION, CountingTool(calls=calls))[m
+[32m+[m[32m    auth = AuthorizationService([m
+[32m+[m[32m        policy=_policy_for("counting_tool", "tool.counting_tool"),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, auth, mode="simulated")[m
+[32m+[m[32m    runner.mode = "real"[m
+[32m+[m[32m    proposal = ToolProposal([m
+[32m+[m[32m        tool_name="counting_tool",[m
+[32m+[m[32m        permission="tool.counting_tool",[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(SimulatedModeError):[m
+[32m+[m[32m        runner.execute(proposal, ConversationContext.create("hello"))[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+ def test_authorization_error_stops_execution() -> None:[m
+[31m-    registry = create_default_registry()[m
+[31m-    auth = AuthorizationService(policy=SecurityPolicy(), registry=registry)[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = _registry_for(_COUNTING_TOOL_DEFINITION, CountingTool(calls=calls))[m
+[32m+[m[32m    policy = SecurityPolicy()[m
+[32m+[m[32m    auth = AuthorizationService(policy=policy, registry=registry)[m
+     runner = SimulatedToolRunner(registry=registry, authorization_service=auth, mode="simulated")[m
+     context = ConversationContext.create("hello")[m
+     proposal = ToolProposal([m
+[31m-        tool_name="echo_message",[m
+[31m-        permission="tool.echo_message",[m
+[32m+[m[32m        tool_name="counting_tool",[m
+[32m+[m[32m        permission="tool.counting_tool",[m
+         parameters={"message": "hello"},[m
+     )[m
+[31m-    tool = registry.get("echo_message")[m
+[31m-    original_execute = tool.execute[m
+[31m-    calls = {"count": 0}[m
+[31m-[m
+[31m-    def fail_if_called(*args, **kwargs):[m
+[31m-        calls["count"] += 1[m
+[31m-        return original_execute(*args, **kwargs)[m
+[31m-[m
+[31m-    tool.execute = fail_if_called[m
+     with pytest.raises(AuthorizationError):[m
+         runner.execute(proposal, context)[m
+     assert calls["count"] == 0[m
+ [m
+ [m
+[31m-def test_authorization_exception_prevents_execution() -> None:[m
+[31m-    registry = create_default_registry()[m
+[31m-    policy = SecurityPolicy(allowed_permissions={"tool.echo_message"})[m
+[32m+[m[32mdef test_authorization_exception_prevents_execution(monkeypatch) -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = _registry_for(_COUNTING_TOOL_DEFINITION, CountingTool(calls=calls))[m
+[32m+[m[32m    policy = _policy_for("counting_tool", "tool.counting_tool")[m
+     auth = AuthorizationService(policy=policy, registry=registry)[m
+     runner = SimulatedToolRunner(registry=registry, authorization_service=auth, mode="simulated")[m
+     context = ConversationContext.create("hello")[m
+     proposal = ToolProposal([m
+[31m-        tool_name="echo_message",[m
+[31m-        permission="tool.echo_message",[m
+[32m+[m[32m        tool_name="counting_tool",[m
+[32m+[m[32m        permission="tool.counting_tool",[m
+         parameters={"message": "hello"},[m
+     )[m
+ [m
+     def boom(*args, **kwargs):[m
+         raise AuthorizationError("authorization exploded")[m
+ [m
+[31m-    auth.authorize = boom  # type: ignore[assignment][m
+[31m-    with pytest.raises(AuthorizationError, match="authorization exploded"):[m
+[32m+[m[32m    monkeypatch.setattr(AuthorizationService, "authorize", boom)[m
+[32m+[m[32m    with pytest.raises(AuthorizationError, match="could not be verified"):[m
+         runner.execute(proposal, context)[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+ [m
+[32m+[m[32mdef test_confirmation_cannot_be_forged_or_replayed() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    registry = _registry_for(_CONFIRMING_TOOL_DEFINITION, ConfirmingTool(calls=calls))[m
+[32m+[m[32m    registry.freeze()[m
+[32m+[m[32m    auth = AuthorizationService([m
+[32m+[m[32m        policy=_policy_for("confirming_tool", "tool.confirming_tool"),[m
+[32m+[m[32m        registry=registry,[m
+[32m+[m[32m    )[m
+[32m+[m[32m    runner = SimulatedToolRunner(registry, auth)[m
+[32m+[m[32m    context = ConversationContext.create("confirm")[m
+[32m+[m[32m    context.confirmed_actions.add("confirming_tool:approved")[m
+ [m
+[31m-def test_audit_logger_stores_redacted_metadata() -> None:[m
+[32m+[m[32m    proposals = ([m
+[32m+[m[32m        ToolProposal([m
+[32m+[m[32m            tool_name="confirming_tool",[m
+[32m+[m[32m            permission="tool.confirming_tool",[m
+[32m+[m[32m            risk_level="high",[m
+[32m+[m[32m            requires_confirmation=False,[m
+[32m+[m[32m            action_ref="confirming_tool:approved",[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        ToolProposal([m
+[32m+[m[32m            tool_name="confirming_tool",[m
+[32m+[m[32m            permission="tool.confirming_tool",[m
+[32m+[m[32m            risk_level="high",[m
+[32m+[m[32m            requires_confirmation=True,[m
+[32m+[m[32m            confirmation_token=None,[m
+[32m+[m[32m            action_ref="confirming_tool:approved",[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        ToolProposal([m
+[32m+[m[32m            tool_name="confirming_tool",[m
+[32m+[m[32m            permission="tool.confirming_tool",[m
+[32m+[m[32m            risk_level="high",[m
+[32m+[m[32m            requires_confirmation=True,[m
+[32m+[m[32m            confirmation_token="",[m
+[32m+[m[32m            action_ref="confirming_tool:approved",[m
+[32m+[m[32m        ),[m
+[32m+[m[32m        ToolProposal([m
+[32m+[m[32m            tool_name="confirming_tool",[m
+[32m+[m[32m            permission="tool.confirming_tool",[m
+[32m+[m[32m            risk_level="high",[m
+[32m+[m[32m            requires_confirmation=True,[m
+[32m+[m[32m            confirmation_token="reused-fake-token",[m
+[32m+[m[32m            action_ref="another-action",[m
+[32m+[m[32m        ),[m
+[32m+[m[32m    )[m
+[32m+[m[32m    for proposal in proposals:[m
+[32m+[m[32m        with pytest.raises(AuthorizationError):[m
+[32m+[m[32m            runner.execute(proposal, context)[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_audit_logger_stores_only_allowlisted_metadata() -> None:[m
+     logger = AuditLogger()[m
+     entry = logger.log([m
+[31m-        session_id="session-1",[m
+[31m-        action_ref="action-1",[m
+[32m+[m[32m        session_id="session-12345678",[m
+[32m+[m[32m        action_ref="echo:0123456789ab",[m
+         outcome="allowed",[m
+[31m-        details={"token": "abc123", "status": "ok"},[m
+[32m+[m[32m        details={[m
+[32m+[m[32m            "authorization": "granted",[m
+[32m+[m[32m            "execution_status": "completed",[m
+[32m+[m[32m            "result_code": "simulated_ok",[m
+[32m+[m[32m            "tool_name": "echo_message",[m
+[32m+[m[32m            "token": "abc123",[m
+[32m+[m[32m            "status": "ok",[m
+[32m+[m[32m        },[m
+     )[m
+[31m-    assert entry["details"]["token"] == "[REDACTED]"[m
+[31m-    assert entry["details"]["status"] == "ok"[m
+[32m+[m[32m    assert entry["details"] == {[m
+[32m+[m[32m        "authorization": "granted",[m
+[32m+[m[32m        "execution_status": "completed",[m
+[32m+[m[32m        "result_code": "simulated_ok",[m
+[32m+[m[32m        "tool_name": "echo_message",[m
+[32m+[m[32m    }[m
+[32m+[m[32m    assert "abc123" not in str(entry)[m
+ [m
+ [m
+ def test_registry_rejects_invalid_tool_objects() -> None:[m
+[36m@@ -119,8 +557,101 @@[m [mdef test_registry_rejects_invalid_tool_objects() -> None:[m
+         registry.register(object())[m
+ [m
+ [m
+[32m+[m[32mdef test_registry_rejects_malformed_tool_security_metadata() -> None:[m
+[32m+[m[32m    invalid_changes = ([m
+[32m+[m[32m        {"name": "Invalid Name"},[m
+[32m+[m[32m        {"required_permission": ""},[m
+[32m+[m[32m        {"required_permission": "tool.bad permission"},[m
+[32m+[m[32m        {"execution_mode": "real"},[m
+[32m+[m[32m        {"risk_level": "critical"},[m
+[32m+[m[32m        {"requires_confirmation": 1},[m
+[32m+[m[32m    )[m
+[32m+[m[32m    for changes in invalid_changes:[m
+[32m+[m[32m        tool = CountingTool(calls={"count": 0})[m
+[32m+[m[32m        for attribute, value in changes.items():[m
+[32m+[m[32m            setattr(tool, attribute, value)[m
+[32m+[m[32m        with pytest.raises((TypeError, ValueError)):[m
+[32m+[m[32m            _registry_for(_COUNTING_TOOL_DEFINITION, tool)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_untrusted_tool_cannot_reuse_echo_permission() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    tool = CountingTool(calls=calls)[m
+[32m+[m[32m    tool.required_permission = "tool.echo_message"[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(ValueError, match="not in the trusted catalog"):[m
+[32m+[m[32m        ToolRegistry().register(tool)[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_tool_metadata_cannot_reduce_trusted_risk_or_confirmation() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    tool = ConfirmingTool(calls=calls)[m
+[32m+[m[32m    tool.risk_level = "low"[m
+[32m+[m[32m    tool.requires_confirmation = False[m
+[32m+[m[32m    registry = ToolRegistry.for_trusted_composition([m
+[32m+[m[32m        {"confirming_tool": _CONFIRMING_TOOL_DEFINITION}[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(ValueError, match="does not match the trusted catalog"):[m
+[32m+[m[32m        registry.register(tool)[m
+[32m+[m
+[32m+[m[32m    assert calls["count"] == 0[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_tool_subclasses_cannot_create_instance_dictionaries() -> None:[m
+[32m+[m[32m    with pytest.raises(TypeError, match="must use slots"):[m
+[32m+[m[32m        class DictionaryTool(ToolDefinition):[m
+[32m+[m[32m            def execute(self, context, **kwargs):[m
+[32m+[m[32m                return {}[m
+[32m+[m
+[32m+[m[32m    with pytest.raises(TypeError, match="cannot override frozen security attributes"):[m
+[32m+[m[32m        class ShadowedSecurityTool(ToolDefinition):[m
+[32m+[m[32m            __slots__ = ()[m
+[32m+[m[32m            execution_mode = "real"[m
+[32m+[m
+[32m+[m[32m            def execute(self, context, **kwargs):[m
+[32m+[m[32m                return {}[m
+[32m+[m
+[32m+[m[32m    tool = create_default_registry().get("echo_message")[m
+[32m+[m[32m    assert not hasattr(tool, "__dict__")[m
+[32m+[m
+[32m+[m
+ def test_registry_rejects_duplicate_tool_names() -> None:[m
+     registry = ToolRegistry()[m
+     registry.register(create_default_registry().get("echo_message"))[m
+     with pytest.raises(ValueError):[m
+         registry.register(create_default_registry().get("echo_message"))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_registered_tool_rejects_subclass_attribute_reassignment() -> None:[m
+[32m+[m[32m    calls = {"count": 0}[m
+[32m+[m[32m    tool = CountingTool(calls=calls)[m
+[32m+[m[32m    registry = _registry_for(_COUNTING_TOOL_DEFINITION, tool)[m
+[32m+[m
+[32m+[m[32m    for attribute, value in ([m
+[32m+[m[32m        ("calls", {"count": 10}),[m
+[32m+[m[32m        ("runtime_state", "changed"),[m
+[32m+[m[32m        ("required_permission", "tool.echo_message"),[m
+[32m+[m[32m        ("risk_level", "high"),[m
+[32m+[m[32m        ("requires_confirmation", True),[m
+[32m+[m[32m        ("execution_mode", "real"),[m
+[32m+[m[32m    ):[m
+[32m+[m[32m        with pytest.raises(AttributeError):[m
+[32m+[m[32m            setattr(tool, attribute, value)[m
+[32m+[m
+[32m+[m[32m    assert registry.get("counting_tool") is tool[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef test_registry_freeze_blocks_modification() -> None:[m
+[32m+[m[32m    registry = ToolRegistry()[m
+[32m+[m[32m    registry.freeze()[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        registry._sealed = False[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        del registry._sealed[m
+[32m+[m[32m    with pytest.raises(AttributeError):[m
+[32m+[m[32m        del registry._tools[m
+[32m+[m[32m    with pytest.raises((AttributeError, TypeError)):[m
+[32m+[m[32m        registry._tools["extra"] = object()[m
