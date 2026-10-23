@@ -820,6 +820,31 @@ def test_pipeline_audit_keeps_only_allowlisted_metadata() -> None:
     }
 
 
+def test_pipeline_marks_unexpected_execute_failure_as_uncertain(monkeypatch) -> None:
+    app = create_application(Settings(mode="simulated", ai_enabled=False))
+    private_marker = "diagnostic-private-marker"
+    effects = {"count": 0}
+
+    def unexpected_failure(self, proposal, context):
+        effects["count"] += 1
+        raise RuntimeError(private_marker)
+
+    monkeypatch.setattr(SimulatedToolRunner, "execute", unexpected_failure)
+
+    result = app.process("repite: prueba de auditoria")
+
+    assert effects["count"] == 1
+    assert result.success is False
+    assert result.authorized is False
+    assert result.error == "Request could not be processed."
+    assert private_marker not in str(result.to_dict())
+
+    details = app.audit_logger.entries[-1]["details"]
+    assert details["authorization"] == "not_verified"
+    assert details["execution_status"] == "uncertain"
+    assert details["error_code"] == "internal_failure"
+    assert details["tool_name"] == "echo_message"
+
 def test_pipeline_does_not_audit_exception_messages(monkeypatch) -> None:
     marker = "exception-private-marker"
     app = create_application(Settings(mode="simulated", ai_enabled=False))

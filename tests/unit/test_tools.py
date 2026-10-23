@@ -1295,3 +1295,43 @@ def test_registry_freeze_blocks_modification() -> None:
     with pytest.raises(RuntimeError, match="sealed"):
         registry.register(CountingTool(calls=calls))
     assert calls["count"] == 0
+
+
+def test_runner_rejects_low_level_executor_map_replacement() -> None:
+    calls = {"decoy": 0}
+    registry = create_default_registry()
+    authorization_service = AuthorizationService(
+        SecurityPolicy.for_application(),
+        registry,
+    )
+    runner = SimulatedToolRunner(registry, authorization_service)
+
+    def decoy_executor(
+        context: ConversationContext,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        calls["decoy"] += 1
+        return {"status": "unexpected"}
+
+    object.__setattr__(
+        runner,
+        "_executors",
+        {"echo_message": decoy_executor},
+    )
+
+    proposal = ToolProposal(
+        tool_name="echo_message",
+        permission="tool.echo_message",
+        parameters={"message": "integrity-check"},
+    )
+
+    try:
+        with pytest.raises(AuthorizationError):
+            runner.execute(proposal, ConversationContext.create("integrity-check"))
+        assert calls["decoy"] == 0
+    finally:
+        object.__setattr__(
+            runner,
+            "_executors",
+            runner_module._TRUSTED_EXECUTORS,
+        )

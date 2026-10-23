@@ -117,6 +117,11 @@ class _SimulatedToolDispatcher:
 
     def execute(self, proposal: ToolProposal, context: ConversationContext) -> dict[str, Any]:
         if (
+            isinstance(self, SimulatedToolRunner)
+            and self._executors is not _TRUSTED_EXECUTORS
+        ):
+            raise AuthorizationError("Authorization could not be verified.")
+        if (
             type(self.registry) is not ToolRegistry
             or self.registry.is_frozen is not True
             or type(self.authorization_service) is not AuthorizationService
@@ -178,6 +183,11 @@ class _SimulatedToolDispatcher:
             )
         except Exception:
             raise PreExecutionAuditError() from None
+        if (
+            isinstance(self, SimulatedToolRunner)
+            and self._executors is not _TRUSTED_EXECUTORS
+        ):
+            raise AuthorizationError("Authorization could not be verified.")
         try:
             executor = self._executors[execution_proposal.tool_name]
             result = executor(context, **execution_proposal.parameters)

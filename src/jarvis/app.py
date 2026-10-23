@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from jarvis.ai.contracts import AIProviderContract
+from jarvis.ai.development_chat import DevelopmentOllamaChatProvider
 from jarvis.ai.local_models import (
     LocalModelLimits,
     LocalModelManager,
@@ -42,6 +43,14 @@ def create_application(
         settings = Settings.from_env(os.environ)
     else:
         settings = Settings.model_validate(settings.model_dump())
+
+    if (
+        settings.local_development_chat_enabled
+        and local_model_manager is not None
+    ):
+        raise ValueError(
+            "Development chat cannot be combined with a production local model manager."
+        )
     if local_model_manager is not None:
         if type(local_model_manager) is not LocalModelManager:
             raise TypeError("Application requires a validated local model manager.")
@@ -57,10 +66,20 @@ def create_application(
             raise ValueError(
                 "Local model manager limits must match validated application settings."
             )
+        if not local_model_manager.is_production_ready:
+            raise ValueError(
+                "Local model dependencies are not verified for production use."
+            )
+
     ai_provider = _create_ai_provider(settings)
+
     if ai_provider is not None and settings.ai_provider == "simulated":
         provider_catalog: dict[str, AIProviderContract] = {
             "simulated": ai_provider
+        }
+    elif settings.local_development_chat_enabled:
+        provider_catalog = {
+            "local": DevelopmentOllamaChatProvider(settings)
         }
     elif local_model_manager is not None:
         provider_catalog = {
@@ -68,9 +87,13 @@ def create_application(
         }
     else:
         provider_catalog = {}
+
     registry: ToolRegistry = create_default_registry()
     policy = SecurityPolicy.for_application()
-    authorization_service = AuthorizationService(policy=policy, registry=registry)
+    authorization_service = AuthorizationService(
+        policy=policy,
+        registry=registry,
+    )
     audit_logger = AuditLogger()
     tool_runner = SimulatedToolRunner(
         registry=registry,

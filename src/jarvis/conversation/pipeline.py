@@ -477,7 +477,7 @@ class ConversationPipeline:
         except Exception:
             details = {
                 "authorization": "not_verified",
-                "execution_status": "blocked",
+                "execution_status": "uncertain",
                 "error_code": "internal_failure",
             }
             tool_name = self._audit_tool_name(proposal)

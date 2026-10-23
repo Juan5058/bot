@@ -17,7 +17,7 @@ _DETAIL_VALUES = {
     "reason": frozenset({"tool_not_registered", "authorization_failed", "invalid_classification", "invalid_proposal", "provider_failure"}),
     "authorization": frozenset({"not_attempted", "not_verified", "denied", "granted"}),
     "execution_status": frozenset(
-        {"denied", "blocked", "authorized", "error", "completed"}
+        {"denied", "blocked", "authorized", "error", "completed", "uncertain"}
     ),
     "error_code": frozenset({"tool_execution_failed", "provider_failure", "internal_failure"}),
     "result_code": frozenset({"simulated_ok", "ok"}),

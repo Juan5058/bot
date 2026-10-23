@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import ipaddress
@@ -23,6 +24,11 @@ class Settings(BaseModel):
     ai_enabled: bool = False
     ai_provider: Literal["simulated", "local", "remote"] = "simulated"
     remote_ai_enabled: bool = Field(default=False, strict=True)
+
+    # Opt-in explícito para conversación local de desarrollo.
+    # No sustituye las verificaciones de identidad de los modelos de producción.
+    local_development_chat_enabled: bool = Field(default=False, strict=True)
+
     local_max_context_tokens: int = Field(default=0, strict=True, ge=0)
     local_ram_budget_mb: int | None = Field(default=None, strict=True, gt=0)
     local_vram_budget_mb: int | None = Field(default=None, strict=True, gt=0)
@@ -32,7 +38,12 @@ class Settings(BaseModel):
         ge=0.0,
         le=1.0,
     )
-    local_max_concurrent_loads: int = Field(default=1, strict=True, ge=1, le=16)
+    local_max_concurrent_loads: int = Field(
+        default=1,
+        strict=True,
+        ge=1,
+        le=16,
+    )
     local_max_concurrent_inferences: int = Field(
         default=1,
         strict=True,
@@ -50,7 +61,12 @@ class Settings(BaseModel):
     )
     log_level: str = Field(default="INFO", min_length=1)
 
-    @field_validator("ai_enabled", "remote_ai_enabled", mode="before")
+    @field_validator(
+        "ai_enabled",
+        "remote_ai_enabled",
+        "local_development_chat_enabled",
+        mode="before",
+    )
     @classmethod
     def parse_boolean_settings(cls, value: Any) -> bool:
         if type(value) is bool:
@@ -61,7 +77,9 @@ class Settings(BaseModel):
                 return True
             if normalized in {"0", "false", "no", "off"}:
                 return False
-        raise ValueError("Boolean settings must use an explicit true or false value.")
+        raise ValueError(
+            "Boolean settings must use an explicit true or false value."
+        )
 
     @field_validator("local_unload_after_inference", mode="before")
     @classmethod
@@ -117,6 +135,7 @@ class Settings(BaseModel):
             port = parsed.port
         except ValueError:
             raise ValueError("Ollama URL must be a local HTTP URL.") from None
+
         if (
             parsed.scheme != "http"
             or hostname is None
@@ -128,6 +147,7 @@ class Settings(BaseModel):
             or parsed.netloc.endswith(":")
         ):
             raise ValueError("Ollama URL must be a local HTTP URL.")
+
         normalized_host = hostname.lower()
         if normalized_host != "localhost":
             try:
@@ -138,6 +158,7 @@ class Settings(BaseModel):
                 ) from None
             if not address.is_loopback or "%" in normalized_host:
                 raise ValueError("Ollama URL must target a loopback address.")
+
         netloc = parsed.netloc.lower()
         if port is not None and not netloc.rsplit(":", 1)[-1].isdigit():
             raise ValueError("Ollama URL port is invalid.")
@@ -182,7 +203,9 @@ class Settings(BaseModel):
     @classmethod
     def validate_log_level(cls, value: Any) -> str:
         if type(value) is not str:
-            raise ValueError("log_level must be one of the supported standard levels.")
+            raise ValueError(
+                "log_level must be one of the supported standard levels."
+            )
         normalized = value.strip().upper()
         if normalized not in _LOG_LEVELS:
             raise ValueError(
@@ -192,6 +215,15 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_selection(self) -> "Settings":
+        if self.local_development_chat_enabled and (
+            not self.ai_enabled
+            or self.ai_provider != "local"
+            or self.remote_ai_enabled
+        ):
+            raise ValueError(
+                "Development chat requires enabled local AI and disabled remote AI."
+            )
+
         if self.ai_provider == "remote":
             if not self.ai_enabled or not self.remote_ai_enabled:
                 raise ValueError(
@@ -203,6 +235,7 @@ class Settings(BaseModel):
                 "remote_ai_enabled=true requires ai_enabled=true and "
                 "ai_provider='remote'."
             )
+
         if not self.ai_enabled and self.ai_provider != "simulated":
             raise ValueError(
                 "When ai_enabled=false, ai_provider must remain 'simulated'."
